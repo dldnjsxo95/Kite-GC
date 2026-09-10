@@ -19,6 +19,7 @@ use crate::msp::{
 };
 use crate::scheduler::SchedulerHandle;
 use crate::state::{ActiveProtocol, AppState};
+use crate::vehicle_registry::LinkRegistry;
 
 /// Number of safehome slots in INAV (indices 0..7). FW_APPROACH shares these indices (8+ = mission
 /// LAND waypoints, handled separately later).
@@ -77,9 +78,9 @@ pub struct SafeHomeConfig {
 
 /// Resolve the MSP scheduler handle, erroring for non-MSP / disconnected links.
 fn msp_handle(
-    proto: &Option<ActiveProtocol>,
+    reg: &LinkRegistry,
 ) -> Result<&SchedulerHandle, String> {
-    match proto.as_ref() {
+    match reg.active_protocol() {
         Some(ActiveProtocol::Msp(h)) => Ok(h),
         Some(_) => Err("FC is not running MSP (INAV)".into()),
         None => Err("Not connected".into()),
@@ -89,12 +90,11 @@ fn msp_handle(
 /// Read all safehomes + radius settings (always) + approaches + autoland settings (≥7.1).
 #[tauri::command(async)]
 pub fn safehome_read_all(state: State<'_, AppState>) -> Result<SafeHomeConfig, String> {
-    let proto = state.protocol.lock().map_err(|e| e.to_string())?;
+    let proto = state.links.lock().map_err(|e| e.to_string())?;
     let handle = msp_handle(&proto)?;
 
     let has_autoland = {
-        let info = state.fc_info.lock().map_err(|e| e.to_string())?;
-        info.as_ref()
+        proto.active_fc_info()
             .and_then(|fc| fc.features.as_ref())
             .map(|f| f.autoland_config)
             .unwrap_or(false)
@@ -169,7 +169,7 @@ pub fn safehome_read_all(state: State<'_, AppState>) -> Result<SafeHomeConfig, S
 /// single EEPROM write to persist. ≥7.1 path (the frontend only exposes the button there).
 #[tauri::command(async)]
 pub fn safehome_write_all(config: SafeHomeConfig, state: State<'_, AppState>) -> Result<(), String> {
-    let proto = state.protocol.lock().map_err(|e| e.to_string())?;
+    let proto = state.links.lock().map_err(|e| e.to_string())?;
     let handle = msp_handle(&proto)?;
 
     // Safehomes: [idx, enabled, lat(4), lon(4)].

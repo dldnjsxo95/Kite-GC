@@ -8,6 +8,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import WindowControls from '$lib/components/WindowControls.svelte';
   import ConnectionControls from '$lib/components/ConnectionControls.svelte';
+  import LinkManager from '$lib/components/LinkManager.svelte';
   import { isLinux, isMacOS, isMobile } from '$lib/platform';
   import ArmingIndicator from '$lib/components/ArmingIndicator.svelte';
   import BatteryIndicator from '$lib/components/BatteryIndicator.svelte';
@@ -276,6 +277,10 @@
       {onConnect}
       {onRescanBle}
     />
+    <!-- Multi-vehicle: vehicle picker, open links, "Add link" (only meaningful once connected). -->
+    {#if connStatus === 'connected'}
+      <LinkManager {ports} {bleDeviceList} {isBleScanning} {baudRates} {onRescanBle} />
+    {/if}
   {/snippet}
 
   <div class="toolbar-right" data-tauri-drag-region>

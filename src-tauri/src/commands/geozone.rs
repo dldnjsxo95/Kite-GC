@@ -17,6 +17,7 @@ use crate::msp::{
 };
 use crate::scheduler::SchedulerHandle;
 use crate::state::{ActiveProtocol, AppState};
+use crate::vehicle_registry::LinkRegistry;
 
 /// Geozone slots the FC config can hold (`MAX_GEOZONES_IN_CONFIG`; ids 0..62).
 const MAX_GEOZONES: u8 = 63;
@@ -56,8 +57,8 @@ pub struct GeozoneConfig {
 }
 
 /// Resolve the MSP scheduler handle, erroring for non-MSP / disconnected links.
-fn msp_handle(proto: &Option<ActiveProtocol>) -> Result<&SchedulerHandle, String> {
-    match proto.as_ref() {
+fn msp_handle(reg: &LinkRegistry) -> Result<&SchedulerHandle, String> {
+    match reg.active_protocol() {
         Some(ActiveProtocol::Msp(h)) => Ok(h),
         Some(_) => Err("FC is not running MSP (INAV)".into()),
         None => Err("Not connected".into()),
@@ -68,12 +69,11 @@ fn msp_handle(proto: &Option<ActiveProtocol>) -> Result<&SchedulerHandle, String
 /// lacks the feature (<8.0), so callers can always invoke it on INAV connect.
 #[tauri::command(async)]
 pub fn geozone_read_all(state: State<'_, AppState>) -> Result<GeozoneConfig, String> {
-    let proto = state.protocol.lock().map_err(|e| e.to_string())?;
+    let proto = state.links.lock().map_err(|e| e.to_string())?;
     let handle = msp_handle(&proto)?;
 
     let has_geozones = {
-        let info = state.fc_info.lock().map_err(|e| e.to_string())?;
-        info.as_ref()
+        proto.active_fc_info()
             .and_then(|fc| fc.features.as_ref())
             .map(|f| f.geozones)
             .unwrap_or(false)
@@ -146,7 +146,7 @@ pub fn geozone_read_all(state: State<'_, AppState>) -> Result<GeozoneConfig, Str
 /// go out in ascending order; a circle writes its single centre vertex with the radius appended.
 #[tauri::command(async)]
 pub fn geozone_write_all(config: GeozoneConfig, state: State<'_, AppState>) -> Result<(), String> {
-    let proto = state.protocol.lock().map_err(|e| e.to_string())?;
+    let proto = state.links.lock().map_err(|e| e.to_string())?;
     let handle = msp_handle(&proto)?;
 
     for id in 0..MAX_GEOZONES {

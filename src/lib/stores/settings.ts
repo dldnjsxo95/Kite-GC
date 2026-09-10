@@ -33,6 +33,9 @@ export type TemperatureUnit = 'c' | 'f';
 export type NightMode = 'off' | 'auto' | 'on';
 /** GCS marker behaviour: hidden / placed once + draggable / live OS tracking. */
 export type GcsMode = 'off' | 'manual' | 'continuous';
+/** How the OTHER connected vehicles are drawn on the 2D map (multi-vehicle): the same top-down 3D
+ *  model as the active vehicle (tinted in the vehicle's colour) or a flat heading arrow. */
+export type FleetMarkerStyle = 'model' | 'symbol';
 
 export interface InterfaceSettings {
   speedUnit: SpeedUnit;
@@ -400,6 +403,7 @@ export interface AppSettings {
   nightMode2D: NightMode;
   /** GCS marker mode: off / manual (drag) / continuous (live OS location). */
   gcsMode: GcsMode;
+  fleetMarkerStyle: FleetMarkerStyle;
   /** Last known physical user location (for Night-Mode auto sunset timing); persisted across sessions. */
   userLocation: { lat: number; lon: number } | null;
   /** Radar (foreign-vehicle tracking) subsystem settings. */
@@ -484,6 +488,7 @@ const defaults: AppSettings = {
   logReplayTime: true,
   nightMode2D: 'auto',
   gcsMode: 'continuous',
+  fleetMarkerStyle: 'model',
   userLocation: null,
   radar: DEFAULT_RADAR,
   airspace: DEFAULT_AIRSPACE,
