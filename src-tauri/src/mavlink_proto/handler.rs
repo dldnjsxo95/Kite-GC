@@ -10,9 +10,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ::mavlink::ardupilotmega::{MavMessage, RC_CHANNELS_OVERRIDE_DATA, MANUAL_CONTROL_DATA};
+use ::mavlink::ardupilotmega::{MavAutopilot, MavMessage, RC_CHANNELS_OVERRIDE_DATA, MANUAL_CONTROL_DATA};
 use ::mavlink::{MavHeader, Message};
-use tauri::{AppHandle, Emitter};
+use crate::vehicle_registry::emitter::VehicleEmitter;
+use crate::vehicle_registry::VehicleInfo;
 
 use crate::flightlog::recorder::FlightRecorderHandle;
 use crate::scheduler::rc_tx::{self, RcTxHandle};
@@ -27,6 +28,12 @@ use super::parser::MavParser;
 
 /// GCS heartbeat interval (1 Hz as per MAVLink spec)
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A secondary vehicle (discovered on a shared link) that stays silent this long is dropped from the
+/// vehicle list (`vehicle-lost`); it comes back on its next HEARTBEAT. The primary never times out here —
+/// its silence is the link's problem and handled by the existing disconnect paths.
+const VEHICLE_TIMEOUT: Duration = Duration::from_secs(10);
+const VEHICLE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Read timeout while RC override is streaming. The loop is read-driven, so the idle read timeout (50 ms)
 /// would otherwise quantize the RC send rate (a 25 Hz request landing on a 50 ms grid only managed ~15
@@ -46,17 +53,19 @@ pub enum MavlinkCommand {
         msg: MavMessage,
         reply: mpsc::Sender<Result<(), String>>,
     },
-    /// Register a channel to receive MISSION_* messages during an active operation
-    RegisterMissionReceiver(mpsc::Sender<MavMessage>),
+    /// Register a channel to receive MISSION_* messages from `sysid` during an active operation.
+    /// Only that vehicle's frames are forwarded — on a shared link the others' MISSION_CURRENT etc.
+    /// keep flowing to telemetry dispatch.
+    RegisterMissionReceiver { sysid: u8, tx: mpsc::Sender<MavMessage> },
     /// Unregister the mission receiver — telemetry dispatch resumes for all messages
     UnregisterMissionReceiver,
     /// Register a channel to receive COMMAND_ACK during an active command operation
     /// (mode switch / arm / takeoff / reposition / …). See `control.rs`.
-    RegisterCommandReceiver(mpsc::Sender<MavMessage>),
+    RegisterCommandReceiver { sysid: u8, tx: mpsc::Sender<MavMessage> },
     /// Unregister the command-ack receiver
     UnregisterCommandReceiver,
     /// Register a channel to receive PARAM_VALUE during an active param read/write (see `params_rt.rs`)
-    RegisterParamReceiver(mpsc::Sender<MavMessage>),
+    RegisterParamReceiver { sysid: u8, tx: mpsc::Sender<MavMessage> },
     /// Unregister the param receiver
     UnregisterParamReceiver,
 }
@@ -65,7 +74,8 @@ pub enum MavlinkCommand {
 pub struct MavlinkHandle {
     cmd_tx: mpsc::Sender<MavlinkCommand>,
     thread: Option<thread::JoinHandle<Option<Box<dyn ByteTransport>>>>,
-    /// System ID of the connected FC (from handshake)
+    /// System ID of the connected FC (from handshake) — the link's primary vehicle.
+    #[allow(dead_code)] // read again in Phase A2 (multi-sysid handler)
     pub fc_sysid: u8,
     /// FC variant string from the handshake ("ArduPlane"/"ArduCopter"/"PX4"/…). Drives firmware-
     /// specific mission handling — notably the home-slot convention (ArduPilot reserves mission item 0
@@ -102,21 +112,82 @@ impl MavlinkHandle {
     }
 }
 
+/// The GCS-requested stream shaping the connect path applied to the handshake vehicle — replayed for
+/// every vehicle discovered later on the same link so they stream the same set at the same rates.
+#[derive(Clone, Debug)]
+pub struct StreamRateConfig {
+    /// "Full MAVLink telemetry": reset our managed messages to the FC's SRn defaults instead of shaping.
+    pub full_telemetry: bool,
+    pub attitude_hz: f64,
+    pub position_hz: f64,
+    pub airspeed_enabled: bool,
+    pub wind_enabled: bool,
+}
+
+/// Per-vehicle decode state on one link. The primary (handshake) vehicle gets one at start; further
+/// vehicles are created on their first autopilot HEARTBEAT (multi-vehicle on a shared link — see
+/// docs/02-design/features/multi-vehicle.design.md §4).
+struct VehicleCtx {
+    compid: u8,
+    fc_variant: String,
+    /// Emits with this vehicle's `vehicleId` stamped on every payload.
+    emitter: VehicleEmitter,
+    analog: AnalogState,
+    batteries: std::collections::BTreeMap<u8, BatteryInstanceData>,
+    fused: FusedPos,
+    quadplane_seen: bool,
+    last_seen: Instant,
+}
+
+impl VehicleCtx {
+    fn new(compid: u8, fc_variant: String, emitter: VehicleEmitter) -> Self {
+        Self {
+            compid,
+            fc_variant,
+            emitter,
+            analog: AnalogState::default(),
+            batteries: std::collections::BTreeMap::new(),
+            fused: FusedPos::default(),
+            quadplane_seen: false,
+            last_seen: Instant::now(),
+        }
+    }
+}
+
+/// Give a newly discovered vehicle the same treatment the connect path gave the handshake vehicle:
+/// stream shaping (or the full-telemetry reset) plus the one-shot EKF-type / home / Q_ENABLE requests.
+fn configure_new_vehicle(transport: &mut dyn ByteTransport, sysid: u8, fc_variant: &str, rates: &StreamRateConfig) {
+    let is_px4 = fc_variant == "PX4";
+    if rates.full_telemetry {
+        super::streamrates::reset_stream_rates(transport, sysid, is_px4);
+    } else {
+        super::streamrates::apply_stream_rates(
+            transport, sysid, rates.attitude_hz, rates.position_hz, rates.airspeed_enabled, rates.wind_enabled, is_px4,
+        );
+    }
+    super::params::request_ekf_type(transport, sysid);
+    super::params::request_home_position(transport, sysid);
+    if fc_variant.starts_with("Ardu") {
+        super::params::request_quadplane_flag(transport, sysid);
+    }
+}
+
 /// Start the MAVLink handler on a dedicated thread
 pub fn start(
     transport: Box<dyn ByteTransport>,
     fc_sysid: u8,
     fc_compid: u8,
     fc_variant: String,
-    app_handle: AppHandle,
+    app_handle: VehicleEmitter,
     recorder: Option<FlightRecorderHandle>,
     rc_tx: RcTxHandle,
+    rates: StreamRateConfig,
 ) -> MavlinkHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<MavlinkCommand>();
 
     let handle_variant = fc_variant.clone();
     let thread = thread::spawn(move || {
-        handler_loop(transport, fc_sysid, fc_compid, fc_variant, app_handle, cmd_rx, recorder, rc_tx)
+        handler_loop(transport, fc_sysid, fc_compid, fc_variant, app_handle, cmd_rx, recorder, rc_tx, rates)
     });
 
     MavlinkHandle {
@@ -128,15 +199,17 @@ pub fn start(
 }
 
 /// Main handler loop — runs until Stop command received
+#[allow(clippy::too_many_arguments)] // thread entry point; args carry the loop's full context
 fn handler_loop(
     mut transport: Box<dyn ByteTransport>,
     fc_sysid: u8,
     fc_compid: u8,
     fc_variant: String,
-    app_handle: AppHandle,
+    app_handle: VehicleEmitter,
     cmd_rx: mpsc::Receiver<MavlinkCommand>,
     recorder: Option<FlightRecorderHandle>,
     rc_tx: RcTxHandle,
+    rates: StreamRateConfig,
 ) -> Option<Box<dyn ByteTransport>> {
     let mut parser = MavParser::new();
     let mut seq = MavSequence::new();
@@ -147,21 +220,25 @@ fn handler_loop(
     // Always-on link-rate meter (release too) — feeds the Relay panel's live RX/TX readout.
     let mut link_stats = crate::link_stats::LinkStats::new();
 
-    // Accumulated analog state — MAVLink splits battery data across multiple messages
-    let mut analog = AnalogState::default();
-    // Per-instance battery monitors (ArduPilot/PX4 multi-battery): latest BATTERY_STATUS per id.
-    let mut batteries: std::collections::BTreeMap<u8, BatteryInstanceData> =
-        std::collections::BTreeMap::new();
-    let mut fused = FusedPos::default();
+    // Every vehicle on this link, by system id. The handshake vehicle is the primary; more appear on
+    // their first autopilot HEARTBEAT (a telemetry radio / UDP port shared by several aircraft). Each
+    // carries its own accumulated analog / battery / position state and its own stamped emitter.
+    let mut vehicles: std::collections::BTreeMap<u8, VehicleCtx> = std::collections::BTreeMap::new();
+    vehicles.insert(fc_sysid, VehicleCtx::new(fc_compid, fc_variant.clone(), app_handle.clone()));
+    let mut last_sweep = Instant::now();
+    // Decoded telemetry feeds the flight recorder for the PRIMARY vehicle only (the raw .tlog still
+    // captures every frame). Secondary vehicles get this empty slot so their arm/disarm can't drive
+    // the primary's recording session.
+    let no_recorder: Option<FlightRecorderHandle> = None;
 
-    // Active mission operation receiver — when set, MISSION_* messages are forwarded
+    // Active mission operation receiver — when set, that vehicle's MISSION_* messages are forwarded
     // here instead of being dispatched as telemetry events.
-    let mut mission_fwd: Option<mpsc::Sender<MavMessage>> = None;
+    let mut mission_fwd: Option<(u8, mpsc::Sender<MavMessage>)> = None;
 
-    // Active command operation receiver — when set, COMMAND_ACK is forwarded here so the
-    // blocking command helper (control.rs) can match the ACK to the command it sent.
-    let mut cmd_fwd: Option<mpsc::Sender<MavMessage>> = None;
-    let mut param_fwd: Option<mpsc::Sender<MavMessage>> = None;
+    // Active command operation receiver — when set, that vehicle's COMMAND_ACK is forwarded here so
+    // the blocking command helper (control.rs) can match the ACK to the command it sent.
+    let mut cmd_fwd: Option<(u8, mpsc::Sender<MavMessage>)> = None;
+    let mut param_fwd: Option<(u8, mpsc::Sender<MavMessage>)> = None;
 
     // QuadPlane detection robustness: a QuadPlane reports MAV_TYPE_FIXED_WING, so the only reliable
     // signal is the Q_ENABLE parameter. The single pre-handler PARAM_REQUEST_READ can be lost on a
@@ -170,7 +247,6 @@ fn handler_loop(
     let is_ardupilot = fc_variant.starts_with("Ardu");
     // PX4 takes RC over MANUAL_CONTROL (#69); everything else (ArduPilot) over RC_CHANNELS_OVERRIDE (#70).
     let is_px4 = fc_variant == "PX4";
-    let mut quadplane_seen = false;
     let mut param_probes: u8 = 0;
     let mut last_param_probe = Instant::now();
     const MAX_PARAM_PROBES: u8 = 6;
@@ -214,9 +290,9 @@ fn handler_loop(
                 let _ = reply.send(result);
                 continue;
             }
-            Ok(MavlinkCommand::RegisterMissionReceiver(tx)) => {
-                log::debug!("MAVLink mission receiver registered");
-                mission_fwd = Some(tx);
+            Ok(MavlinkCommand::RegisterMissionReceiver { sysid, tx }) => {
+                log::debug!("MAVLink mission receiver registered (sysid={})", sysid);
+                mission_fwd = Some((sysid, tx));
                 continue;
             }
             Ok(MavlinkCommand::UnregisterMissionReceiver) => {
@@ -224,9 +300,9 @@ fn handler_loop(
                 mission_fwd = None;
                 continue;
             }
-            Ok(MavlinkCommand::RegisterCommandReceiver(tx)) => {
-                log::debug!("MAVLink command receiver registered");
-                cmd_fwd = Some(tx);
+            Ok(MavlinkCommand::RegisterCommandReceiver { sysid, tx }) => {
+                log::debug!("MAVLink command receiver registered (sysid={})", sysid);
+                cmd_fwd = Some((sysid, tx));
                 continue;
             }
             Ok(MavlinkCommand::UnregisterCommandReceiver) => {
@@ -234,9 +310,9 @@ fn handler_loop(
                 cmd_fwd = None;
                 continue;
             }
-            Ok(MavlinkCommand::RegisterParamReceiver(tx)) => {
-                log::debug!("MAVLink param receiver registered");
-                param_fwd = Some(tx);
+            Ok(MavlinkCommand::RegisterParamReceiver { sysid, tx }) => {
+                log::debug!("MAVLink param receiver registered (sysid={})", sysid);
+                param_fwd = Some((sysid, tx));
                 continue;
             }
             Ok(MavlinkCommand::UnregisterParamReceiver) => {
@@ -316,7 +392,8 @@ fn handler_loop(
         }
 
         // 2b. Re-probe Q_ENABLE until the FC answers (robust QuadPlane detection — see above).
-        if is_ardupilot && !quadplane_seen && param_probes < MAX_PARAM_PROBES
+        let primary_quadplane_seen = vehicles.get(&fc_sysid).is_some_and(|c| c.quadplane_seen);
+        if is_ardupilot && !primary_quadplane_seen && param_probes < MAX_PARAM_PROBES
             && last_param_probe.elapsed() >= PARAM_PROBE_INTERVAL
         {
             super::params::request_quadplane_flag(&mut *transport, fc_sysid);
@@ -329,7 +406,41 @@ fn handler_loop(
             Ok(0) => {}
             Ok(n) => {
                 for frame in parser.parse_bytes(&buf[..n]) {
-                    if frame.header.system_id != fc_sysid { continue; }
+                    let sysid = frame.header.system_id;
+                    // Other GCSs on the same link (Mission Planner, QGC, …) are never vehicles.
+                    if sysid == codec::GCS_SYSTEM_ID { continue; }
+
+                    // Multi-vehicle on one link: an unknown sysid becomes a vehicle on its first
+                    // autopilot HEARTBEAT (same acceptance rule as the handshake); any other frame from
+                    // an unknown sysid is ignored until then.
+                    if !vehicles.contains_key(&sysid) {
+                        let MavMessage::HEARTBEAT(ref hb) = frame.message else { continue };
+                        let is_autopilot = hb.autopilot != MavAutopilot::MAV_AUTOPILOT_INVALID
+                            || frame.header.component_id == 1;
+                        if !is_autopilot { continue; }
+                        let (variant, platform_type) = super::vehicle::identify(hb.autopilot, hb.mavtype);
+                        let ctx = VehicleCtx::new(frame.header.component_id, variant, app_handle.for_sysid(sysid));
+                        log::info!(
+                            "MAVLink: discovered vehicle sysid={} compid={} ({}) on L{}",
+                            sysid, frame.header.component_id, ctx.fc_variant, app_handle.link_id(),
+                        );
+                        configure_new_vehicle(&mut *transport, sysid, &ctx.fc_variant, &rates);
+                        let _ = ctx.emitter.emit("vehicle-discovered", VehicleInfo {
+                            vehicle_id: ctx.emitter.key().to_string(),
+                            link_id: app_handle.link_id(),
+                            sysid,
+                            compid: frame.header.component_id,
+                            fc_variant: ctx.fc_variant.clone(),
+                            platform_type,
+                            mav_type: hb.mavtype as u8,
+                            protocol: "MAVLink".to_string(),
+                            primary: false,
+                        });
+                        vehicles.insert(sysid, ctx);
+                    }
+                    let ctx = vehicles.get_mut(&sysid).expect("vehicle registered above");
+                    ctx.last_seen = Instant::now();
+                    let primary = sysid == fc_sysid;
 
                     msg_count += 1;
                     debug_tracker.on_rx(frame.message.message_id(), frame.raw_bytes.len());
@@ -347,12 +458,14 @@ fn handler_loop(
                     // Forward MISSION_* messages to any active mission operation.
                     // This keeps mission protocol messages out of the telemetry stream.
                     if is_mission_message(&frame.message) {
-                        if let Some(ref tx) = mission_fwd {
-                            if tx.send(frame.message).is_err() {
-                                // Receiver dropped — operation likely timed out
-                                mission_fwd = None;
+                        if let Some((target, ref tx)) = mission_fwd {
+                            if target == sysid {
+                                if tx.send(frame.message).is_err() {
+                                    // Receiver dropped — operation likely timed out
+                                    mission_fwd = None;
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
 
@@ -360,22 +473,26 @@ fn handler_loop(
                     // to the command it sent (mode/arm/takeoff/reposition/…). Otherwise it falls
                     // through to dispatch (which logs it at trace level).
                     if matches!(frame.message, MavMessage::COMMAND_ACK(_)) {
-                        if let Some(ref tx) = cmd_fwd {
-                            if tx.send(frame.message).is_err() {
-                                cmd_fwd = None;
+                        if let Some((target, ref tx)) = cmd_fwd {
+                            if target == sysid {
+                                if tx.send(frame.message).is_err() {
+                                    cmd_fwd = None;
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
 
                     // Forward PARAM_VALUE to an active param read/write (fence params). Otherwise it
                     // falls through to dispatch (the handshake EKF-type reader).
                     if matches!(frame.message, MavMessage::PARAM_VALUE(_)) {
-                        if let Some(ref tx) = param_fwd {
-                            if tx.send(frame.message).is_err() {
-                                param_fwd = None;
+                        if let Some((target, ref tx)) = param_fwd {
+                            if target == sysid {
+                                if tx.send(frame.message).is_err() {
+                                    param_fwd = None;
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
 
@@ -386,11 +503,16 @@ fn handler_loop(
                     // End-Flight-popup loop). Their frames are still recorded to the tlog above; they're
                     // just not treated as telemetry. Non-HEARTBEAT messages are unaffected (ADS-B,
                     // gimbal feedback, etc. legitimately come from other components on the same sysid).
-                    if matches!(frame.message, MavMessage::HEARTBEAT(_)) && frame.header.component_id != fc_compid {
+                    if matches!(frame.message, MavMessage::HEARTBEAT(_)) && frame.header.component_id != ctx.compid {
                         continue;
                     }
 
-                    dispatch_message(&frame.header, &frame.message, &fc_variant, &app_handle, &mut analog, &mut batteries, &mut fused, &mut quadplane_seen, &recorder);
+                    dispatch_message(
+                        &frame.header, &frame.message, &ctx.fc_variant, &ctx.emitter,
+                        &mut ctx.analog, &mut ctx.batteries, &mut ctx.fused, &mut ctx.quadplane_seen,
+                        if primary { &recorder } else { &no_recorder },
+                        primary,
+                    );
                 }
             }
             Err(crate::transport::TransportError::Timeout) => {}
@@ -404,6 +526,25 @@ fn handler_loop(
             }
             Err(e) => {
                 log::warn!("MAVLink read error: {}", e);
+            }
+        }
+
+        // 3b. Drop secondary vehicles that fell silent (they re-register on their next HEARTBEAT).
+        if last_sweep.elapsed() >= VEHICLE_SWEEP_INTERVAL {
+            last_sweep = Instant::now();
+            let stale: Vec<u8> = vehicles.iter()
+                .filter(|(s, c)| **s != fc_sysid && c.last_seen.elapsed() > VEHICLE_TIMEOUT)
+                .map(|(s, _)| *s)
+                .collect();
+            for s in stale {
+                if let Some(c) = vehicles.remove(&s) {
+                    log::info!("MAVLink: vehicle sysid={} silent for {}s — dropped", s, VEHICLE_TIMEOUT.as_secs());
+                    let _ = c.emitter.emit("vehicle-lost", serde_json::json!({
+                        "vehicleId": c.emitter.key(),
+                        "linkId": c.emitter.link_id(),
+                        "reason": "timeout",
+                    }));
+                }
             }
         }
 
@@ -559,7 +700,10 @@ struct FusedPos {
 /// Dispatch a received MAVLink message to the same Tauri events as the MSP scheduler.
 /// This ensures widgets/store work identically regardless of protocol.
 #[allow(clippy::too_many_arguments)] // dispatch helper threading the handler's mutable decode state
-fn dispatch_message(header: &MavHeader, message: &MavMessage, fc_variant: &str, app_handle: &AppHandle, analog: &mut AnalogState, batteries: &mut std::collections::BTreeMap<u8, BatteryInstanceData>, fused: &mut FusedPos, quadplane_seen: &mut bool, recorder: &Option<FlightRecorderHandle>) {
+/// `primary`: the link's handshake vehicle. Only it feeds the process-global OS link status (Android
+/// notification / track backfill) — secondary vehicles on a shared link would otherwise flap it.
+#[allow(clippy::too_many_arguments)] // per-vehicle decode context, split out of VehicleCtx for borrowck
+fn dispatch_message(header: &MavHeader, message: &MavMessage, fc_variant: &str, app_handle: &VehicleEmitter, analog: &mut AnalogState, batteries: &mut std::collections::BTreeMap<u8, BatteryInstanceData>, fused: &mut FusedPos, quadplane_seen: &mut bool, recorder: &Option<FlightRecorderHandle>, primary: bool) {
     match message {
         // ── HEARTBEAT → telemetry-status + telemetry-flightmode ─────
         MavMessage::HEARTBEAT(hb) => {
@@ -585,8 +729,8 @@ fn dispatch_message(header: &MavHeader, message: &MavMessage, fc_variant: &str, 
             // Flight mode (canonical, protocol-agnostic). See docs/active/FLIGHT_MODE_UNIFIED.md.
             let fm = crate::flightmode::classify_mavlink(hb.custom_mode, fc_variant);
             let _ = app_handle.emit("telemetry-flightmode", &fm);
-            crate::link_status::on_status(&data);
-            crate::link_status::on_flightmode(&fm);
+            if primary { crate::link_status::on_status(&data); }
+            if primary { crate::link_status::on_flightmode(&fm); }
 
             if let Some(ref rec) = recorder {
                 if let Ok(mut r) = rec.lock() {
@@ -605,7 +749,7 @@ fn dispatch_message(header: &MavHeader, message: &MavMessage, fc_variant: &str, 
                 lon: home.longitude as f64 / 1e7,
                 alt: home.altitude as f64 / 1000.0, // mm AMSL → m
             };
-            crate::link_status::on_home(data.lat, data.lon);
+            if primary { crate::link_status::on_home(data.lat, data.lon); }
             let _ = app_handle.emit("home-position", &data);
         }
 
@@ -673,7 +817,7 @@ fn dispatch_message(header: &MavHeader, message: &MavMessage, fc_variant: &str, 
                 course: fused.course,
             };
             let _ = app_handle.emit("telemetry-gps", &gps);
-            crate::link_status::on_gps(&gps);
+            if primary { crate::link_status::on_gps(&gps); }
 
             let alt = AltitudeData {
                 altitude: gpi.relative_alt as f64 / 1000.0, // mm → m (relative = baro-like)
@@ -769,7 +913,7 @@ fn dispatch_message(header: &MavHeader, message: &MavMessage, fc_variant: &str, 
             }
 
             let _ = app_handle.emit("telemetry-analog", &analog.to_analog_data());
-            crate::link_status::on_analog(&analog.to_analog_data());
+            if primary { crate::link_status::on_analog(&analog.to_analog_data()); }
             if let Some(ref rec) = recorder {
                 if let Ok(mut r) = rec.lock() { r.on_analog(&analog.to_analog_data()); }
             }
@@ -887,7 +1031,7 @@ fn dispatch_message(header: &MavHeader, message: &MavMessage, fc_variant: &str, 
             // rssi is 0–254 in RC_CHANNELS (255 = invalid), map to 0–1023 like INAV
             analog.rssi = (rc.rssi as u16) * 4;
             let _ = app_handle.emit("telemetry-analog", &analog.to_analog_data());
-            crate::link_status::on_analog(&analog.to_analog_data());
+            if primary { crate::link_status::on_analog(&analog.to_analog_data()); }
             if let Some(ref rec) = recorder {
                 if let Ok(mut r) = rec.lock() { r.on_analog(&analog.to_analog_data()); }
             }
@@ -937,7 +1081,7 @@ fn dispatch_message(header: &MavHeader, message: &MavMessage, fc_variant: &str, 
                     analog.battery_percentage = pct;
                 }
                 let _ = app_handle.emit("telemetry-analog", &analog.to_analog_data());
-            crate::link_status::on_analog(&analog.to_analog_data());
+            if primary { crate::link_status::on_analog(&analog.to_analog_data()); }
             }
 
             if let Some(ref rec) = recorder {
@@ -1026,8 +1170,11 @@ fn dispatch_message(header: &MavHeader, message: &MavMessage, fc_variant: &str, 
                 let value = pv.param_value as i32;
                 let blackbox = if name == "SDLOG_MODE" { value >= 0 } else { value != 0 };
                 eprintln!("[MAVLINK-PARAM] {} = {} (blackbox={})", name, value, blackbox);
-                if let Ok(mut info) = tauri::Manager::state::<crate::state::AppState>(app_handle).fc_info.lock() {
-                    if let Some(i) = info.as_mut() { i.blackbox = Some(blackbox); }
+                // Only the link's primary vehicle owns the link's FcInfo (multi-vehicle).
+                if primary {
+                    if let Ok(mut reg) = tauri::Manager::state::<crate::state::AppState>(app_handle.app()).links.lock() {
+                        if let Some(entry) = reg.get_mut(app_handle.link_id()) { entry.fc_info.blackbox = Some(blackbox); }
+                    }
                 }
                 let _ = app_handle.emit("telemetry-vehicle", serde_json::json!({
                     "blackbox": blackbox,

@@ -9,6 +9,7 @@ import { writable, get } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { connection, connectionProtocol, fcLinkAlive } from '$lib/stores/connection';
+import { isActive, activeVehicleId, vehicles } from '$lib/stores/vehicles';
 import { arduVehicleClass } from '$lib/stores/missionArdupilot';
 import type { FlightModeState } from '$lib/helpers/flightModeRegistry';
 
@@ -159,6 +160,48 @@ const defaultTelemetry: TelemetryData = {
 
 export const telemetry = writable<TelemetryData>({ ...defaultTelemetry });
 
+// ── Per-vehicle telemetry (multi-vehicle) ────────────────────────────
+// `telemetry` above stays the ACTIVE vehicle's view (every widget reads it unchanged). Alongside it,
+// every vehicle's latest state is kept by id so the map can draw the whole fleet. Listeners route each
+// stamped payload through `upd()`: it always updates the vehicle's own entry and, for the active
+// vehicle, the singleton too. `allTelemetry` is published throttled (~10 Hz) — the per-vehicle map
+// changes on every frame of every vehicle and the fleet layer doesn't need more than that.
+const perVehicle = new Map<string, TelemetryData>();
+export const allTelemetry = writable<ReadonlyMap<string, TelemetryData>>(new Map());
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleFlush(): void {
+  if (flushTimer) return;
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    allTelemetry.set(new Map(perVehicle));
+  }, 100);
+}
+function upd(payload: unknown, fn: (t: TelemetryData) => TelemetryData): void {
+  const id = payload && typeof payload === 'object' ? (payload as { vehicleId?: unknown }).vehicleId : undefined;
+  if (typeof id === 'string') {
+    perVehicle.set(id, fn(perVehicle.get(id) ?? { ...defaultTelemetry }));
+    scheduleFlush();
+  }
+  if (isActive(payload)) telemetry.update(fn);
+}
+// Switching the active vehicle: the singleton continues from that vehicle's last known state instead
+// of a blank slate (so widgets don't flash zeros while its next frames arrive).
+let seededFor: string | null = null;
+activeVehicleId.subscribe((id) => {
+  if (id === seededFor) return;
+  seededFor = id;
+  if (!id) return;
+  telemetry.set({ ...(perVehicle.get(id) ?? defaultTelemetry) });
+});
+// Vehicles the backend dropped (link closed, HEARTBEAT timeout) leave the fleet map too.
+vehicles.subscribe((known) => {
+  let changed = false;
+  for (const id of [...perVehicle.keys()]) {
+    if (!known.has(id)) { perVehicle.delete(id); changed = true; }
+  }
+  if (changed) scheduleFlush();
+});
+
 // ── Dev GPS injection (debug only) ──────────────────────────────────
 // Force the UAV position/altitude (+ a valid fix) regardless of the real telemetry, so conflict alerts
 // and the map can be tested over busy airspace from the desk. Driven from the dev Debug Monitor.
@@ -198,6 +241,8 @@ gpsInject.subscribe((g) => {
 
 export function resetTelemetry() {
   telemetry.set({ ...defaultTelemetry });
+  perVehicle.clear();
+  scheduleFlush();
   // Altitude reference defaults back to MSL (replay/idle treat altMsl as true MSL). The ground anchor
   // is intentionally NOT cleared — it persists across reconnects so a relative-only session (LTM) keeps
   // its reference until a real-MSL protocol supersedes it.
@@ -266,6 +311,8 @@ telemetry.subscribe((t) => {
 });
 
 // ── Event listeners for scheduler telemetry ─────────────────────────
+// Every per-vehicle payload carries `vehicleId` (backend VehicleEmitter); `isActive()` drops frames
+// from any vehicle other than the selected one so a shared link can't bleed into the widgets.
 
 let unlisteners: UnlistenFn[] = [];
 
@@ -275,7 +322,7 @@ export async function startTelemetryListeners() {
 
   unlisteners.push(
     await listen<{ roll: number; pitch: number; yaw: number }>('telemetry-attitude', (event) => {
-      telemetry.update((t) => ({
+      upd(event.payload, (t) => ({
         ...t,
         roll: event.payload.roll,
         pitch: event.payload.pitch,
@@ -294,7 +341,7 @@ export async function startTelemetryListeners() {
     }>('telemetry-gps', (event) => {
       const p = event.payload;
       const o = gpsOverride; // dev injection wins over real position/altitude when active
-      telemetry.update((t) => ({
+      upd(event.payload, (t) => ({
         ...t,
         fixType: o ? 3 : p.fix_type,
         numSat: p.num_sat,
@@ -312,7 +359,7 @@ export async function startTelemetryListeners() {
 
   unlisteners.push(
     await listen<{ altitude: number; vario: number }>('telemetry-altitude', (event) => {
-      telemetry.update((t) => ({
+      upd(event.payload, (t) => ({
         ...t,
         altitude: event.payload.altitude,
         vario: event.payload.vario,
@@ -329,7 +376,7 @@ export async function startTelemetryListeners() {
       'telemetry-analog',
       (event) => {
         const p = event.payload;
-        telemetry.update((t) => ({
+        upd(event.payload, (t) => ({
           ...t,
           voltage: p.voltage,
           current: p.current,
@@ -350,16 +397,16 @@ export async function startTelemetryListeners() {
       (event) => {
         // Only throttle is consumed continuously today; uptime/flight_time ride along for a future
         // flight-time timer (seeded once, then counted locally).
-        telemetry.update((t) => ({ ...t, throttle: event.payload.throttle_pct, lastUpdate: Date.now() }));
+        upd(event.payload, (t) => ({ ...t, throttle: event.payload.throttle_pct, lastUpdate: Date.now() }));
       }
     )
   );
 
   unlisteners.push(
-    await listen<{ id: number; voltage: number; current: number; mah_drawn: number; percentage: number; cell_count: number; temperature: number | null }[]>(
+    await listen<{ value: { id: number; voltage: number; current: number; mah_drawn: number; percentage: number; cell_count: number; temperature: number | null }[] }>(
       'telemetry-batteries',
       (event) => {
-        const batteries: BatteryInstance[] = event.payload.map((b) => ({
+        const batteries: BatteryInstance[] = event.payload.value.map((b) => ({
           id: b.id,
           voltage: b.voltage,
           current: b.current,
@@ -368,7 +415,7 @@ export async function startTelemetryListeners() {
           cellCount: b.cell_count,
           temperature: b.temperature,
         }));
-        telemetry.update((t) => ({ ...t, batteries, lastUpdate: Date.now() }));
+        upd(event.payload, (t) => ({ ...t, batteries, lastUpdate: Date.now() }));
       }
     )
   );
@@ -378,7 +425,7 @@ export async function startTelemetryListeners() {
       'telemetry-linkstats',
       (event) => {
         const p = event.payload;
-        telemetry.update((t) => ({
+        upd(event.payload, (t) => ({
           ...t,
           link: { rssiPercent: p.rssi_percent, rssiDbm: p.rssi_dbm, lq: p.lq, snrDb: p.snr_db },
           lastUpdate: Date.now(),
@@ -390,7 +437,7 @@ export async function startTelemetryListeners() {
   unlisteners.push(
     await listen<{ arming_flags: number; flight_mode_flags: number; cpu_load: number; sensor_status: number; msp_rc_override?: boolean }>('telemetry-status', (event) => {
       // flight_mode_flags is now forensic only — the canonical mode comes via telemetry-flightmode.
-      telemetry.update((t) => ({
+      upd(event.payload, (t) => ({
         ...t,
         armingFlags: event.payload.arming_flags,
         statusSeen: true,
@@ -405,7 +452,7 @@ export async function startTelemetryListeners() {
 
   unlisteners.push(
     await listen<FlightModeState>('telemetry-flightmode', (event) => {
-      telemetry.update((t) => ({
+      upd(event.payload, (t) => ({
         ...t,
         flightMode: { primary: event.payload.primary, modifiers: event.payload.modifiers ?? [] },
         lastUpdate: Date.now(),
@@ -420,7 +467,7 @@ export async function startTelemetryListeners() {
       rc_receiver: number;
     }>('telemetry-sensor-status', (event) => {
       const p = event.payload;
-      telemetry.update((t) => ({
+      upd(event.payload, (t) => ({
         ...t,
         sensorGyro: p.gyro,
         sensorAcc: p.acc,
@@ -440,14 +487,14 @@ export async function startTelemetryListeners() {
   // EKF estimator health (ArduPilot) — drives the header EKF indicator.
   unlisteners.push(
     await listen<{ status: number; max_variance: number; flags: number }>('telemetry-ekf-status', (event) => {
-      telemetry.update((t) => ({ ...t, ekfStatus: event.payload.status, lastUpdate: Date.now() }));
+      upd(event.payload, (t) => ({ ...t, ekfStatus: event.payload.status, lastUpdate: Date.now() }));
     })
   );
 
   // EKF core version (AHRS_EKF_TYPE) — one-shot reply on connect, so no lastUpdate bump.
   unlisteners.push(
     await listen<{ ekf_type: number }>('telemetry-ekf-type', (event) => {
-      telemetry.update((t) => ({ ...t, ekfType: event.payload.ekf_type }));
+      upd(event.payload, (t) => ({ ...t, ekfType: event.payload.ekf_type }));
     })
   );
 
@@ -455,6 +502,7 @@ export async function startTelemetryListeners() {
   // mission vehicle class can only be upgraded to quadplane from this one-shot param. Upgrade only.
   unlisteners.push(
     await listen<{ quadplane?: boolean; blackbox?: boolean }>('telemetry-vehicle', (event) => {
+      if (!isActive(event.payload)) return;
       if (event.payload.quadplane) arduVehicleClass.set('quadplane');
       // Logging-backend answer (ArduPilot LOG_BACKEND_TYPE / PX4 SDLOG_MODE) → FC info for the UAV Info
       // panel's vehicle-library save.
@@ -467,7 +515,7 @@ export async function startTelemetryListeners() {
 
   unlisteners.push(
     await listen<{ active_wp_number: number; nav_state: number }>('telemetry-nav-status', (event) => {
-      telemetry.update((t) => ({
+      upd(event.payload, (t) => ({
         ...t,
         activeWpNumber: event.payload.active_wp_number,
         navState: event.payload.nav_state,
@@ -478,7 +526,7 @@ export async function startTelemetryListeners() {
 
   unlisteners.push(
     await listen<{ airspeed: number }>('telemetry-airspeed', (event) => {
-      telemetry.update((t) => ({
+      upd(event.payload, (t) => ({
         ...t,
         airspeed: event.payload.airspeed,
         lastUpdate: Date.now(),
@@ -488,7 +536,7 @@ export async function startTelemetryListeners() {
 
   unlisteners.push(
     await listen<{ direction_from_deg: number; speed_ms: number }>('telemetry-wind', (event) => {
-      telemetry.update((t) => ({
+      upd(event.payload, (t) => ({
         ...t,
         windDirFrom: event.payload.direction_from_deg,
         windSpeedMs: event.payload.speed_ms,
@@ -500,6 +548,7 @@ export async function startTelemetryListeners() {
   // Altitude reference: does this protocol deliver true MSL, or only arming-relative altitude?
   unlisteners.push(
     await listen<{ msl: boolean }>('telemetry-alt-ref', (event) => {
+      if (!isActive(event.payload)) return;
       altReference.set({ msl: event.payload.msl });
       // A real-MSL protocol supersedes any relative ground anchor.
       if (event.payload.msl) groundAnchor.set(null);
@@ -509,6 +558,7 @@ export async function startTelemetryListeners() {
   // Passive-telemetry locked protocol (+ optional secondary) for the connection status box.
   unlisteners.push(
     await listen<{ primary: string; secondary: string | null }>('telemetry-protocol', (event) => {
+      if (!isActive(event.payload)) return;
       connectionProtocol.set({ primary: event.payload.primary, secondary: event.payload.secondary });
     })
   );
@@ -516,13 +566,14 @@ export async function startTelemetryListeners() {
   // FC-link liveness (passive): fresh FC-origin frames, independent of the cached-state re-emit + RX noise.
   unlisteners.push(
     await listen<{ alive: boolean }>('telemetry-fc-link', (event) => {
+      if (!isActive(event.payload)) return;
       fcLinkAlive.set(event.payload.alive);
     })
   );
 
   unlisteners.push(
     await listen<{ hdop: number }>('telemetry-gps-stats', (event) => {
-      telemetry.update((t) => ({
+      upd(event.payload, (t) => ({
         ...t,
         // Ignore invalid values to avoid one-frame UI oscillation.
         gpsHdop: event.payload.hdop > 0 ? event.payload.hdop : t.gpsHdop,

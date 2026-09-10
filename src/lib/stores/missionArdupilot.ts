@@ -236,7 +236,7 @@ function mavTypeToClass(mavType: number): VehicleClass | null {
  *  the MAV_TYPE (PX4 reports it accurately). For **ArduPilot** the MAV_TYPE is only a reliable QuadPlane
  *  signal (a QuadPlane reports fc_variant "ArduPlane" but a VTOL_* MAV_TYPE); otherwise the per-vehicle
  *  fc_variant string ("ArduPlane"/"ArduCopter"/…) is authoritative. */
-function detectVehicleClass(variant: string, mavType: number | null | undefined): VehicleClass | null {
+export function detectVehicleClass(variant: string, mavType: number | null | undefined): VehicleClass | null {
   if (variant.toLowerCase() === 'px4') return mavType != null ? mavTypeToClass(mavType) : null;
   // MAV_TYPE VTOL range (19–25: tailsitter duo/quad, tiltrotor, …) → QuadPlane.
   if (mavType != null && mavType >= 19 && mavType <= 25) return 'quadplane';

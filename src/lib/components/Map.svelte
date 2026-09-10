@@ -16,7 +16,11 @@
   import L from "leaflet";
   import "leaflet/dist/leaflet.css";
   import { settings } from "$lib/stores/settings";
-  import { telemetry } from "$lib/stores/telemetry";
+  import { telemetry, allTelemetry, type TelemetryData } from "$lib/stores/telemetry";
+  import { vehicles, activeVehicleId, type VehicleSummary } from "$lib/stores/vehicles";
+  import { switchVehicle } from "$lib/controllers/connectionController";
+  import { matchActiveMode } from "$lib/helpers/mavModes";
+  import { vehicleColor } from "$lib/helpers/vehicleColors";
   import { safehomeWorking, isSafehomeEmpty, setSafehomePosition } from "$lib/stores/safehome";
   import {
     geozoneWorking, geozoneEditing, geozoneMissionResult, GEOZONE_SHAPE_CIRCULAR,
@@ -37,12 +41,12 @@
   import { cachedTileLayer } from "$lib/cache/CachedTileLayer";
   import { initTileCache } from "$lib/cache/tileCache";
   import { isWebKitGtk, isAndroid } from "$lib/platform";
-  import { homePosition, homeMarkerShown } from "$lib/stores/home";
+  import { homePosition, homeMarkerShown, vehicleHomes, type VehicleHome } from "$lib/stores/home";
   import { editMode, geoWaypoints, launchPoint, replayActive, toDeg } from "$lib/stores/mission";
   import { autopilotSystem } from "$lib/stores/autopilotContext";
-  import { arduMission, arduVehicleClass, arduEditMode } from "$lib/stores/missionArdupilot";
+  import { arduMission, arduVehicleClass, arduEditMode, detectVehicleClass } from "$lib/stores/missionArdupilot";
   import { activeSurveyPattern } from "$lib/stores/surveyPattern.svelte";
-  import { guidedActive, guidedTarget, repositionTo, activeMode, guidedParams, fcLoiterRadius, type GuidedParams } from "$lib/controllers/vehicleControl";
+  import { guidedActive, guidedTarget, guidedTargets, repositionTo, activeMode, guidedParams, fcLoiterRadius, type GuidedParams } from "$lib/controllers/vehicleControl";
   import GuidedTargetForm from "$lib/components/control/GuidedTargetForm.svelte";
   import { cmdHasLocation } from "$lib/helpers/arduCommandCatalog";
   import { connection } from "$lib/stores/connection";
@@ -200,6 +204,7 @@
     for (const mk of [uavMarker, playbackMarker]) mk?.setIcon(makeModelIcon(modelSizePx(lat)));
     modelDrawnKey = ''; // new canvas → the cached "already drawn" state is stale
     applyFollowFrame();
+    updateFleet(); // fleet model markers are zoom-sized too
   }
 
   // The model is rasterised in software (uavTopDown.ts) — the one expensive step of a follow frame.
@@ -255,6 +260,48 @@
   // (monitoring only). Cleared on arm; the colored flight trail takes over.
   let preArmTrailLine: L.Polyline | undefined;
   let preArmPositions: L.LatLng[] = [];
+
+  // ── Per-vehicle trail ownership (multi-vehicle) ──────────────────────────────────────────
+  // The live trail variables above always belong to ONE vehicle (`trailOwner`, = the active one). On
+  // a switch the in-progress segment is finalised and every layer is parked in `trailStash` under the
+  // old owner — it stays on the map as that vehicle's history and never gets a point from another
+  // vehicle. The new owner starts a fresh segment at its own position (its parked layers, if any,
+  // come back under the live variables so the arm-edge "new flight" clear still removes them). The
+  // follow smoother is reset too, so the marker snaps to the new vehicle instead of gliding across.
+  interface TrailState { segments: L.Polyline[]; preArms: L.Polyline[]; wasArmed: boolean }
+  const trailStash = new Map<string, TrailState>();
+  let trailOwner: string | null = null;
+  function switchTrailOwner(next: string | null) {
+    if (next === trailOwner) return;
+    if (trailOwner) {
+      if (activeTrailLine) { trailSegments.push(activeTrailLine); activeTrailLine = undefined; }
+      const prev = trailStash.get(trailOwner);
+      trailStash.set(trailOwner, {
+        segments: [...(prev?.segments ?? []), ...trailSegments],
+        preArms: [...(prev?.preArms ?? []), ...(preArmTrailLine ? [preArmTrailLine] : [])],
+        wasArmed,
+      });
+    }
+    trailOwner = next;
+    const st = next ? trailStash.get(next) : undefined;
+    trailSegments = st ? [...st.segments] : [];
+    if (next && st) trailStash.set(next, { ...st, segments: [] }); // segments now live in the variables again
+    activeTrailLine = undefined;
+    trailCurrentPositions = [];
+    trailCurrentColor = '';
+    preArmTrailLine = undefined; // the old pre-arm line stays parked; a new one starts here
+    preArmPositions = [];
+    wasArmed = st?.wasArmed ?? false;
+    followTarget = null; followCurrent = null;
+    turnRateDegS = 0; prevCog = null; turnArcShown = false;
+  }
+  /** Drop every parked layer of `id` (vehicle lost / new session). */
+  function dropStashedTrail(id: string) {
+    const st = trailStash.get(id);
+    if (!st) return;
+    for (const l of [...st.segments, ...st.preArms]) { try { map?.removeLayer(l); } catch { /* gone */ } }
+    trailStash.delete(id);
+  }
   let playbackLayerGroup: L.LayerGroup | undefined;
   let playbackMarker: L.Marker | undefined;
 
@@ -437,6 +484,281 @@
     radarActive; radarMapSettings; radarReference; radarRefAltM; uiScale;
     if (map) updateRadar();
   });
+
+  // ── Fleet: the OTHER connected vehicles (multi-vehicle) ──────────────────────────────────────
+  // The active vehicle keeps the full model marker / trail / follow above. Every other vehicle the
+  // backend knows is drawn here as a coloured heading arrow with its name (click = make it active),
+  // plus — while it is in its guided mode — its FC-confirmed target and a dashed line vehicle → target,
+  // so it is obvious who is flying where. Same add/update/remove-by-id shape as the radar layer.
+  let fleetLayer: L.LayerGroup | undefined;
+  const fleetMarkers = new Map<string, L.Marker>();
+  const fleetTargetMarkers = new Map<string, L.Marker>();
+  const fleetTargetLines = new Map<string, L.Polyline>();
+  let fleetTelem: ReadonlyMap<string, TelemetryData> = new Map();
+  let fleetKnown: Map<string, VehicleSummary> = new Map();
+  let fleetActive: string | null = null;
+  let fleetTargets: ReadonlyMap<string, { lat: number; lon: number; ts: number }> = new Map();
+  const FLEET_TARGET_STALE_MS = 10_000;
+  const FLEET_BASE_PX = 26;
+
+  function escapeHtml(str: string): string {
+    return str.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
+  }
+  function fleetIconHtml(color: string, heading: number, label: string, size: number, armed: boolean): string {
+    const svg = `<svg viewBox="0 0 24 24" width="${size}" height="${size}" style="transform:rotate(${heading}deg)"><path d="M12 2 L20 20 L12 16 L4 20 Z" fill="${color}" stroke="#000" stroke-width="1.2" stroke-linejoin="round"/></svg>`;
+    return `<div class="fleet-icon${armed ? ' armed' : ''}" style="width:${size}px;height:${size}px">${svg}<span class="fleet-label">${escapeHtml(label)}</span></div>`;
+  }
+  /** Model style: a persistent canvas (drawn by `drawFleetModel`) + the name label. */
+  function fleetModelIconHtml(label: string, size: number, armed: boolean): string {
+    return `<div class="fleet-icon fleet-model${armed ? ' armed' : ''}" style="width:${size}px;height:${size}px"><canvas width="${size}" height="${size}" style="display:block"></canvas><span class="fleet-label">${escapeHtml(label)}</span></div>`;
+  }
+  // Meshes by model URI, shared across vehicles of the same kind (quad / plane / vtol …). Loading is
+  // kicked off on first use; until it lands the marker shows a coloured dot, then the next fleet
+  // update draws the model.
+  const fleetMeshes = new Map<string, UavMesh>();
+  const fleetMeshLoading = new Set<string>();
+  function fleetMesh(platformType: number): UavMesh | null {
+    const uri = modelUri(resolveModelKind(platformType as PlatformType, modelOverride));
+    const m = fleetMeshes.get(uri);
+    if (m) return m;
+    if (!fleetMeshLoading.has(uri)) {
+      fleetMeshLoading.add(uri);
+      loadUavMesh(uri)
+        .then((mesh) => { fleetMeshes.set(uri, mesh); if (map) updateFleet(); })
+        .catch(() => { /* keep the dot */ });
+    }
+    return null;
+  }
+  /** How strongly the vehicle colour tints the model — enough to tell four identical quads apart. */
+  const FLEET_MODEL_TINT = 0.55;
+  function drawFleetModel(marker: L.Marker, platformType: number, heading: number, pitch: number, roll: number, color: string) {
+    const cv = marker.getElement()?.querySelector('canvas') as HTMLCanvasElement | null;
+    const ctx = cv?.getContext('2d');
+    if (!cv || !ctx) return;
+    const mesh = fleetMesh(platformType);
+    if (!mesh) {
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      ctx.fillStyle = color; ctx.beginPath(); ctx.arc(cv.width / 2, cv.height / 2, 6, 0, 2 * Math.PI); ctx.fill();
+      return;
+    }
+    renderUavTopDown(ctx, mesh, cv.width, heading, pitch, roll, hexToRgb01(color), FLEET_MODEL_TINT);
+  }
+  /** Per-marker icon signature — the DivIcon is only rebuilt when this changes (a `setIcon` replaces
+   *  the canvas, so the model path avoids it on every frame and just redraws the canvas). */
+  const fleetIconKeys = new Map<string, string>();
+
+  // Fleet trails: while a vehicle is NOT active its path is still recorded — a plain line in its colour
+  // (thin while disarmed, 2 px while armed; an arm edge starts a new flight and drops the old lines).
+  // When it becomes active the detailed mode-coloured trail takes over; its fleet line stays as history.
+  interface FleetTrail { pts: L.LatLng[]; line?: L.Polyline; armed: boolean }
+  const fleetTrails = new Map<string, FleetTrail>();
+  const fleetTrailHistory = new Map<string, L.Polyline[]>();
+  const fleetHomeMarkers = new Map<string, L.Marker>();
+  let fleetHomes: ReadonlyMap<string, VehicleHome> = new Map();
+
+  function pushFleetHistory(id: string, line: L.Polyline) {
+    const h = fleetTrailHistory.get(id) ?? [];
+    h.push(line);
+    fleetTrailHistory.set(id, h);
+  }
+  function updateFleetTrail(id: string, tv: TelemetryData, color: string, layer: L.LayerGroup) {
+    const armed = (tv.armingFlags & (1 << ARMING_FLAG_ARMED)) !== 0;
+    const ft = fleetTrails.get(id) ?? { pts: [], armed };
+    if (armed !== ft.armed) {
+      // Arm-state edge = segment boundary (style change); arming also means a NEW flight → old lines go.
+      if (ft.line) { pushFleetHistory(id, ft.line); ft.line = undefined; }
+      if (armed) {
+        for (const l of fleetTrailHistory.get(id) ?? []) layer.removeLayer(l);
+        fleetTrailHistory.delete(id);
+        ft.pts = [];
+      } else {
+        ft.pts = ft.pts.length ? [ft.pts[ft.pts.length - 1]] : [];
+      }
+      ft.armed = armed;
+    }
+    const pos = L.latLng(tv.lat, tv.lon);
+    if (!ft.pts.length || pos.distanceTo(ft.pts[ft.pts.length - 1]) >= MIN_TRAIL_DIST) {
+      ft.pts.push(pos);
+      if (ft.pts.length >= 2) {
+        if (ft.line) ft.line.setLatLngs(ft.pts);
+        else ft.line = L.polyline(ft.pts, { color, weight: armed ? 2 : 1, opacity: armed ? 0.7 : 0.6, interactive: false }).addTo(layer);
+      }
+    }
+    fleetTrails.set(id, ft);
+  }
+  /** The vehicle became active: its fleet line becomes history; the detailed trail continues from here. */
+  function retireFleetTrail(id: string) {
+    const ft = fleetTrails.get(id);
+    if (!ft) return;
+    if (ft.line) pushFleetHistory(id, ft.line);
+    fleetTrails.delete(id);
+  }
+  function createFleetHomeIcon(color: string): L.DivIcon {
+    const html = `<div style="width:18px;height:18px;display:flex;align-items:center;justify-content:center;background:${color};border:2px solid #fff;border-radius:50%;font:bold 10px 'Segoe UI',Tahoma,sans-serif;color:#000;box-shadow:0 0 5px rgba(0,0,0,.5)">H</div>`;
+    return L.divIcon({ className: 'fleet-home-divicon', html, iconSize: [18, 18], iconAnchor: [9, 9] });
+  }
+  function updateFleetHome(v: VehicleSummary, color: string, layer: L.LayerGroup) {
+    const h = fleetHomes.get(v.vehicleId);
+    const m = fleetHomeMarkers.get(v.vehicleId);
+    if (!h) { if (m) { layer.removeLayer(m); fleetHomeMarkers.delete(v.vehicleId); } return; }
+    if (m) { m.setLatLng([h.lat, h.lon]); return; }
+    const mk = L.marker([h.lat, h.lon], { icon: createFleetHomeIcon(color), interactive: true, zIndexOffset: 450 });
+    mk.bindTooltip(`${v.name} · ${get(t)('connection.vehicleHome')}`, { direction: 'top', offset: [0, -10], opacity: 0.9 });
+    mk.addTo(layer);
+    fleetHomeMarkers.set(v.vehicleId, mk);
+  }
+  function removeFleetHome(id: string, layer: L.LayerGroup) {
+    const m = fleetHomeMarkers.get(id);
+    if (m) { layer.removeLayer(m); fleetHomeMarkers.delete(id); }
+  }
+  /** Vehicles the backend dropped (while others remain) take their lines, homes and parked trails along. */
+  function pruneFleetState(layer: L.LayerGroup) {
+    if (fleetKnown.size === 0) return; // disconnect-all keeps the last picture, like the single-vehicle trail did
+    const gone = (id: string) => !fleetKnown.has(id);
+    for (const [id, ft] of fleetTrails) if (gone(id)) { if (ft.line) layer.removeLayer(ft.line); fleetTrails.delete(id); }
+    for (const [id, hs] of fleetTrailHistory) if (gone(id)) { for (const l of hs) layer.removeLayer(l); fleetTrailHistory.delete(id); }
+    for (const [id, m] of fleetHomeMarkers) if (gone(id)) { layer.removeLayer(m); fleetHomeMarkers.delete(id); }
+    for (const id of [...trailStash.keys()]) if (gone(id) && id !== trailOwner) dropStashedTrail(id);
+  }
+  /** A new session after a disconnect-all: the previous fleet's picture goes. */
+  function clearFleetHistory() {
+    if (!fleetLayer) return;
+    for (const ft of fleetTrails.values()) if (ft.line) fleetLayer.removeLayer(ft.line);
+    fleetTrails.clear();
+    for (const hs of fleetTrailHistory.values()) for (const l of hs) fleetLayer.removeLayer(l);
+    fleetTrailHistory.clear();
+    for (const m of fleetHomeMarkers.values()) fleetLayer.removeLayer(m);
+    fleetHomeMarkers.clear();
+    for (const id of [...trailStash.keys()]) if (id !== trailOwner) dropStashedTrail(id);
+  }
+  function createFleetTargetIcon(color: string): L.DivIcon {
+    const html = `<div style="box-sizing:border-box;width:16px;height:16px;border:2px solid #000;border-radius:50% 50% 50% 0;transform:rotate(-45deg);background:${color};box-shadow:0 0 3px rgba(0,0,0,.6)"></div>`;
+    return L.divIcon({ className: 'fleet-target-divicon', html, iconSize: [16, 16], iconAnchor: [8, 19] });
+  }
+  /** Whether a (non-active) vehicle is in its guided mode — decided from its own HEARTBEAT identity. */
+  function fleetInGuided(v: VehicleSummary, tv: TelemetryData): boolean {
+    const variant = v.fcVariant.toLowerCase();
+    const sys = variant === 'px4' ? 'px4' : variant.startsWith('ardu') ? 'ardupilot' : null;
+    if (!sys) return false;
+    const cls = detectVehicleClass(v.fcVariant, v.mavType) ?? 'copter';
+    return matchActiveMode(sys, cls, tv.flightModeFlags)?.guided === true;
+  }
+
+  function updateFleet() {
+    if (!map) return;
+    if (!fleetLayer) fleetLayer = L.layerGroup().addTo(map);
+    const ordered = [...fleetKnown.values()].sort((a, b) => a.linkId - b.linkId || a.sysid - b.sysid);
+    const size = Math.round(FLEET_BASE_PX * (uiScale || 1));
+    const style = get(settings).fleetMarkerStyle;
+    const now = Date.now();
+    const seen = new Set<string>();
+    const seenTargets = new Set<string>();
+    ordered.forEach((v, idx) => {
+      const tv = fleetTelem.get(v.vehicleId);
+      if (!tv || !tv.lastUpdate || !isValidGpsCoordinate(tv.lat, tv.lon)) return;
+      const color = vehicleColor(idx);
+      const isActiveVehicle = v.vehicleId === fleetActive;
+
+      if (!isActiveVehicle) {
+        seen.add(v.vehicleId);
+        const armed = (tv.armingFlags & (1 << ARMING_FLAG_ARMED)) !== 0;
+        const modelStyle = style === 'model';
+        const mSize = modelStyle ? modelSizePx(tv.lat) : size;
+        // Symbol: the heading is baked into the SVG, so its key includes it; model: drawn on canvas.
+        const key = modelStyle
+          ? `m|${mSize}|${v.name}|${armed}`
+          : `s|${mSize}|${v.name}|${armed}|${color}|${Math.round(tv.yaw)}`;
+        const tip = `${v.name} · ${tv.flightMode.primary || '—'} · ${Math.round(tv.altitude)} m · ${(tv.groundSpeed).toFixed(1)} m/s`;
+        let marker = fleetMarkers.get(v.vehicleId);
+        if (marker) {
+          marker.setLatLng([tv.lat, tv.lon]);
+          marker.setTooltipContent(tip);
+        } else {
+          const id = v.vehicleId;
+          marker = L.marker([tv.lat, tv.lon], { zIndexOffset: 900 });
+          marker.bindTooltip(tip, { direction: 'top', offset: [0, -mSize / 2], opacity: 0.95 });
+          marker.on('click', () => { void switchVehicle(id); });
+          marker.addTo(fleetLayer!);
+          fleetMarkers.set(id, marker);
+        }
+        if (fleetIconKeys.get(v.vehicleId) !== key) {
+          marker.setIcon(L.divIcon({
+            className: 'fleet-divicon',
+            html: modelStyle ? fleetModelIconHtml(v.name, mSize, armed) : fleetIconHtml(color, tv.yaw, v.name, mSize, armed),
+            iconSize: [mSize, mSize], iconAnchor: [mSize / 2, mSize / 2],
+          }));
+          fleetIconKeys.set(v.vehicleId, key);
+        }
+        if (modelStyle) drawFleetModel(marker, v.platformType, tv.yaw, tv.pitch, tv.roll, color);
+        updateFleetTrail(v.vehicleId, tv, color, fleetLayer!);
+        updateFleetHome(v, color, fleetLayer!);
+      } else {
+        retireFleetTrail(v.vehicleId);
+        removeFleetHome(v.vehicleId, fleetLayer!);
+      }
+
+      // Guided target + heading line. Active vehicle: the Guided UI already draws the "G" target marker,
+      // so only the line is added here (same green); others get a small target pin in their colour.
+      const tgt = fleetTargets.get(v.vehicleId);
+      const inGuided = isActiveVehicle
+        ? (get(activeMode)?.guided === true || get(guidedActive))
+        : fleetInGuided(v, tv);
+      if (tgt && inGuided && now - tgt.ts < FLEET_TARGET_STALE_MS && isValidGpsCoordinate(tgt.lat, tgt.lon)) {
+        seenTargets.add(v.vehicleId);
+        const lineColor = isActiveVehicle ? '#59aa29' : color;
+        const pts: L.LatLngExpression[] = [[tv.lat, tv.lon], [tgt.lat, tgt.lon]];
+        const line = fleetTargetLines.get(v.vehicleId);
+        if (line) {
+          line.setLatLngs(pts);
+          line.setStyle({ color: lineColor });
+        } else {
+          const l = L.polyline(pts, { color: lineColor, weight: 2, dashArray: '6 6', opacity: 0.9, interactive: false });
+          l.addTo(fleetLayer!);
+          fleetTargetLines.set(v.vehicleId, l);
+        }
+        if (!isActiveVehicle) {
+          const tm = fleetTargetMarkers.get(v.vehicleId);
+          const tipT = `${v.name} → ${get(t)('control.guidedTarget')}`;
+          if (tm) {
+            tm.setLatLng([tgt.lat, tgt.lon]);
+            tm.setTooltipContent(tipT);
+          } else {
+            const m = L.marker([tgt.lat, tgt.lon], { icon: createFleetTargetIcon(color), interactive: true, zIndexOffset: 460 });
+            m.bindTooltip(tipT, { direction: 'top', offset: [0, -16], opacity: 0.9, permanent: true, className: 'fleet-target-tip' });
+            m.addTo(fleetLayer!);
+            fleetTargetMarkers.set(v.vehicleId, m);
+          }
+        } else {
+          const tm = fleetTargetMarkers.get(v.vehicleId);
+          if (tm) { fleetLayer!.removeLayer(tm); fleetTargetMarkers.delete(v.vehicleId); }
+        }
+      }
+    });
+    for (const [id, m] of fleetMarkers) {
+      if (!seen.has(id)) { fleetLayer.removeLayer(m); fleetMarkers.delete(id); fleetIconKeys.delete(id); }
+    }
+    pruneFleetState(fleetLayer);
+    for (const [id, l] of fleetTargetLines) {
+      if (!seenTargets.has(id)) { fleetLayer.removeLayer(l); fleetTargetLines.delete(id); }
+    }
+    for (const [id, m] of fleetTargetMarkers) {
+      if (!seenTargets.has(id)) { fleetLayer.removeLayer(m); fleetTargetMarkers.delete(id); }
+    }
+  }
+  const unsubFleet: (() => void)[] = [
+    allTelemetry.subscribe((v) => { fleetTelem = v; if (map) updateFleet(); }),
+    vehicles.subscribe((v) => {
+      const wasEmpty = fleetKnown.size === 0;
+      fleetKnown = v;
+      if (wasEmpty && v.size > 0) clearFleetHistory(); // new session → previous fleet's picture goes
+      if (map) updateFleet();
+    }),
+    activeVehicleId.subscribe((v) => { switchTrailOwner(v); fleetActive = v; if (map) updateFleet(); }),
+    vehicleHomes.subscribe((v) => { fleetHomes = v; if (map) updateFleet(); }),
+    guidedTargets.subscribe((v) => { fleetTargets = v; if (map) updateFleet(); }),
+    guidedActive.subscribe(() => { if (map) updateFleet(); }),
+  ];
+  $effect(() => { uiScale; $settings.fleetMarkerStyle; if (map) updateFleet(); });
 
   // Home position
   let homeMarker: L.Marker | undefined;
@@ -2057,6 +2379,8 @@
     applyViewModeEffects(viewMode);
     appliedViewMode = viewMode;
 
+    updateFleet();
+
     // Subscribe to telemetry for UAV position, flight trail, and home detection
     unsubTelemetry = telemetry.subscribe((t) => {
       if (t.lastUpdate > 0) {
@@ -2362,6 +2686,7 @@
     unsubConnForJump?.();
     unsubSafehome?.();
     guidedTargetMarker?.remove();
+    for (const u of unsubFleet) u();
     unsubGeozone?.();
     unsubGeozoneViol?.();
     unsubFence?.();
@@ -2385,6 +2710,7 @@
       if (fenceLayer) map.removeLayer(fenceLayer);
       if (rallyLayer) map.removeLayer(rallyLayer);
       if (radarLayer) map.removeLayer(radarLayer);
+      if (fleetLayer) map.removeLayer(fleetLayer);
       map.remove();
     }
   });
@@ -2746,6 +3072,47 @@
     box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
   }
   :global(.guided-popup-wrap .leaflet-popup-tip) { background: rgba(46, 46, 46, 0.97); }
+
+  /* Fleet (other connected vehicles) markers — heading arrow + name; armed vehicles get a halo. */
+  :global(.fleet-divicon),
+  :global(.fleet-home-divicon),
+  :global(.fleet-target-divicon) {
+    background: none;
+    border: none;
+  }
+  :global(.fleet-divicon .fleet-icon) {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.8));
+  }
+  :global(.fleet-divicon .fleet-icon.armed) {
+    filter: drop-shadow(0 0 4px rgba(255, 255, 255, 0.9));
+  }
+  :global(.fleet-divicon .fleet-icon.fleet-model canvas) {
+    display: block;
+  }
+  :global(.fleet-divicon .fleet-label) {
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translate(-50%, 1px);
+    font: 600 10px 'Segoe UI', Tahoma, sans-serif;
+    color: #fff;
+    text-shadow: 0 0 2px #000, 0 0 2px #000, 0 1px 1px #000;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+  :global(.fleet-target-tip) {
+    background: rgba(46, 46, 46, 0.92);
+    color: #fff;
+    border: 1px solid #555;
+    font-size: 11px;
+    padding: 2px 6px;
+  }
+  :global(.fleet-target-tip::before) { border-top-color: #555; }
 
   /* Foreign-vehicle (radar) contact icons */
   :global(.radar-divicon) {

@@ -167,8 +167,8 @@ pub fn mission_download(
     state: State<'_, AppState>,
     store: State<'_, MissionStore>,
 ) -> Result<Mission, String> {
-    let proto = state.protocol.lock().map_err(|e| e.to_string())?;
-    let handle = match proto.as_ref() {
+    let proto = state.links.lock().map_err(|e| e.to_string())?;
+    let handle = match proto.active_protocol() {
         Some(ActiveProtocol::Msp(h)) => h,
         Some(ActiveProtocol::Mavlink(_)) => return Err("Mission download not supported via MAVLink yet".into()),
         Some(ActiveProtocol::PassiveTelemetry(_)) => return Err("Mission download not available in telemetry monitoring mode".into()),
@@ -214,8 +214,8 @@ pub fn mission_download(
 /// `(async)` — the MSP_WP_GETINFO request blocks on the scheduler; keep it off the main thread.
 #[tauri::command(async)]
 pub fn mission_fc_info(state: State<'_, AppState>) -> Result<MissionInfo, String> {
-    let proto = state.protocol.lock().map_err(|e| e.to_string())?;
-    let handle = match proto.as_ref() {
+    let proto = state.links.lock().map_err(|e| e.to_string())?;
+    let handle = match proto.active_protocol() {
         Some(ActiveProtocol::Msp(h)) => h,
         Some(ActiveProtocol::Mavlink(_)) => return Err("Mission info not supported via MAVLink yet".into()),
         Some(ActiveProtocol::PassiveTelemetry(_)) => return Err("Mission info not available in telemetry monitoring mode".into()),
@@ -242,8 +242,8 @@ pub async fn mission_upload(
     // Resolve AGL → AMSL before touching the serial handle (async terrain lookup).
     let resolved = resolve_agl(&mission, &terrain).await;
 
-    let proto = state.protocol.lock().map_err(|e| e.to_string())?;
-    let handle = match proto.as_ref() {
+    let proto = state.links.lock().map_err(|e| e.to_string())?;
+    let handle = match proto.active_protocol() {
         Some(ActiveProtocol::Msp(h)) => h,
         Some(ActiveProtocol::Mavlink(_)) => return Err("Mission upload not supported via MAVLink yet".into()),
         Some(ActiveProtocol::PassiveTelemetry(_)) => return Err("Mission upload not available in telemetry monitoring mode".into()),
@@ -333,8 +333,8 @@ pub async fn mission_upload_multi(
     let mission = Mission { waypoints: combined, info: MissionInfo::default(), dirty: false, home: None };
     let resolved = resolve_agl(&mission, &terrain).await;
 
-    let proto = state.protocol.lock().map_err(|e| e.to_string())?;
-    let handle = match proto.as_ref() {
+    let proto = state.links.lock().map_err(|e| e.to_string())?;
+    let handle = match proto.active_protocol() {
         Some(ActiveProtocol::Msp(h)) => h,
         Some(ActiveProtocol::Mavlink(_)) => return Err("Mission upload not supported via MAVLink yet".into()),
         Some(ActiveProtocol::PassiveTelemetry(_)) => return Err("Mission upload not available in telemetry monitoring mode".into()),
@@ -375,8 +375,8 @@ pub async fn mission_upload_multi(
 /// scheduler.
 #[tauri::command(async)]
 pub fn mission_get_active_index(state: State<'_, AppState>) -> Result<u8, String> {
-    let proto = state.protocol.lock().map_err(|e| e.to_string())?;
-    let handle = match proto.as_ref() {
+    let proto = state.links.lock().map_err(|e| e.to_string())?;
+    let handle = match proto.active_protocol() {
         Some(ActiveProtocol::Msp(h)) => h,
         Some(ActiveProtocol::Mavlink(_)) => return Err("Mission info not supported via MAVLink yet".into()),
         Some(ActiveProtocol::PassiveTelemetry(_)) => return Err("Mission info not available in telemetry monitoring mode".into()),
@@ -486,19 +486,12 @@ pub fn mission_load_file(path: String, store: State<'_, MissionStore>) -> Result
 /// MISSION_ITEM (up to seconds each over a slow SiK link). A plain sync command would run on the
 /// main thread and freeze the whole UI for the duration of the download.
 #[tauri::command(async)]
-pub fn ardu_mission_download(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Vec<ArduWaypoint>, String> {
-    // Clone the command sender + sysid while holding the mutex briefly.
-    // The actual protocol exchange runs after the lock is released.
-    let (cmd_tx, fc_sysid, reserve_home) = {
-        let proto = state.protocol.lock().map_err(|e| e.to_string())?;
-        match proto.as_ref() {
-            // PX4 has no home mission-slot (item 0 is a real waypoint); ArduPilot reserves slot 0 for home.
-            Some(ActiveProtocol::Mavlink(h)) => (h.cmd_tx_clone(), h.fc_sysid, !h.fc_variant.eq_ignore_ascii_case("px4")),
-            Some(ActiveProtocol::Msp(_)) => return Err("FC is not running MAVLink".into()),
-            Some(ActiveProtocol::PassiveTelemetry(_)) => return Err("FC is not running MAVLink".into()),
-            None => return Err("Not connected".into()),
-        }
-    };
+pub fn ardu_mission_download(vehicle_id: Option<String>, app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Vec<ArduWaypoint>, String> {
+    // Resolve the target (frontend "L1:S1" key, None = active vehicle) while holding the registry
+    // mutex briefly. The actual protocol exchange runs after the lock is released.
+    // PX4 has no home mission-slot (item 0 is a real waypoint); ArduPilot reserves slot 0 for home.
+    let t = state.mav_target(vehicle_id.as_deref())?;
+    let (cmd_tx, fc_sysid, reserve_home) = (t.cmd_tx, t.sysid, !t.fc_variant.eq_ignore_ascii_case("px4"));
     mavlink_proto::mission::download(
         &cmd_tx,
         fc_sysid,
@@ -515,6 +508,7 @@ pub fn ardu_mission_download(app: tauri::AppHandle, state: State<'_, AppState>) 
 /// `ardu_mission_download`).
 #[tauri::command(async)]
 pub fn ardu_mission_upload(
+    vehicle_id: Option<String>,
     waypoints: Vec<ArduWaypoint>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -522,16 +516,9 @@ pub fn ardu_mission_upload(
     if waypoints.is_empty() {
         return Err("No waypoints to upload".into());
     }
-    let (cmd_tx, fc_sysid, reserve_home) = {
-        let proto = state.protocol.lock().map_err(|e| e.to_string())?;
-        match proto.as_ref() {
-            // PX4 has no home mission-slot (item 0 is a real waypoint); ArduPilot reserves slot 0 for home.
-            Some(ActiveProtocol::Mavlink(h)) => (h.cmd_tx_clone(), h.fc_sysid, !h.fc_variant.eq_ignore_ascii_case("px4")),
-            Some(ActiveProtocol::Msp(_)) => return Err("FC is not running MAVLink".into()),
-            Some(ActiveProtocol::PassiveTelemetry(_)) => return Err("FC is not running MAVLink".into()),
-            None => return Err("Not connected".into()),
-        }
-    };
+    // PX4 has no home mission-slot (item 0 is a real waypoint); ArduPilot reserves slot 0 for home.
+    let t = state.mav_target(vehicle_id.as_deref())?;
+    let (cmd_tx, fc_sysid, reserve_home) = (t.cmd_tx, t.sysid, !t.fc_variant.eq_ignore_ascii_case("px4"));
     mavlink_proto::mission::upload(
         &cmd_tx,
         fc_sysid,

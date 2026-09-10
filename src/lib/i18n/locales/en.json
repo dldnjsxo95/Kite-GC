@@ -62,7 +62,22 @@
     "btNamePlaceholder": "Custom name",
     "btNameSave": "Save name",
     "btNameCancel": "Cancel",
-    "panelTitle": "Connection"
+    "panelTitle": "Connection",
+    "links": "Links",
+    "linksTip": "Vehicles and links — switch the active vehicle or open another link",
+    "linksTitle": "Links",
+    "vehicles": "Vehicles",
+    "noVehicles": "No vehicles yet",
+    "activeVehicle": "Active",
+    "closeLink": "Close this link",
+    "addLink": "Add link",
+    "switchArmedTitle": "Switch vehicle while armed?",
+    "switchArmedBody": "The current vehicle is armed. Widgets and the control panel will follow {name} instead — commands you send afterwards go to {name}.",
+    "switchArmedConfirm": "Switch",
+    "fleetStyle": "Other vehicles on the map",
+    "fleetStyleModel": "3D model",
+    "fleetStyleSymbol": "Symbol",
+    "vehicleHome": "Home"
   },
   "cesiumKey": {
     "title": "3D Terrain Needs a Cesium Ion Key",

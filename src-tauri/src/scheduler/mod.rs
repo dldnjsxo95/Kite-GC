@@ -21,6 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter};
+use crate::vehicle_registry::emitter::VehicleEmitter;
 
 use crate::flightlog::recorder::FlightRecorderHandle;
 use crate::link_stats::LinkStats;
@@ -227,7 +228,7 @@ impl SchedulerHandle {
 pub fn start(
     transport: Box<dyn Transport>,
     config: TelemetryConfig,
-    app_handle: AppHandle,
+    app_handle: VehicleEmitter,
     recorder: Option<FlightRecorderHandle>,
     radar_ingest: RadarIngest,
     radar_msp_enabled: Arc<AtomicBool>,
@@ -250,7 +251,7 @@ pub fn start(
 fn scheduler_loop(
     mut transport: Box<dyn Transport>,
     config: TelemetryConfig,
-    app_handle: AppHandle,
+    app_handle: VehicleEmitter,
     cmd_rx: mpsc::Receiver<SchedulerCommand>,
     recorder: Option<FlightRecorderHandle>,
     radar_ingest: RadarIngest,
@@ -923,7 +924,7 @@ fn dispatch_telemetry(
     payload_bytes: &[u8],
     box_ids: &[u8],
     recorder: &Option<FlightRecorderHandle>,
-    app_handle: &AppHandle,
+    app_handle: &VehicleEmitter,
     link_stats_enabled: bool,
     override_active: &mut bool,
 ) {

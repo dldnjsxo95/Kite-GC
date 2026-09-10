@@ -40,7 +40,7 @@ pub fn read_params(
     names: &[&str],
 ) -> HashMap<String, f32> {
     let (tx, rx) = mpsc::channel();
-    if cmd_tx.send(MavlinkCommand::RegisterParamReceiver(tx)).is_err() {
+    if cmd_tx.send(MavlinkCommand::RegisterParamReceiver { sysid: fc_sysid, tx }).is_err() {
         return HashMap::new();
     }
     std::thread::sleep(Duration::from_millis(10)); // let the handler pick up the registration

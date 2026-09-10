@@ -7,8 +7,11 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use std::sync::mpsc;
+
 use crate::aero::AeroCache;
 use crate::flightlog::recorder::{ActiveTempPathHandle, FlightRecorderHandle, PendingSessionHandle};
+use crate::mavlink_proto::handler::MavlinkCommand;
 use crate::mavlink_proto::MavlinkHandle;
 use crate::msp::FcInfo;
 use crate::passive_telemetry::PassiveHandle;
@@ -16,6 +19,7 @@ use crate::radar::source::SourceUpdate;
 use crate::radar::RadarManager;
 use crate::scheduler::rc_tx::{RcTxHandle, RcTxState};
 use crate::scheduler::SchedulerHandle;
+use crate::vehicle_registry::LinkRegistry;
 
 /// Which protocol is currently active
 pub enum ActiveProtocol {
@@ -25,12 +29,21 @@ pub enum ActiveProtocol {
     PassiveTelemetry(PassiveHandle),
 }
 
+/// A resolved MAVLink command target: the link's handler channel plus the system id to address.
+/// Returned by [`AppState::mav_target`] so command handlers never hold the registry lock while they
+/// wait on the vehicle.
+pub struct MavTarget {
+    pub cmd_tx: mpsc::Sender<MavlinkCommand>,
+    pub sysid: u8,
+    /// FC variant of the link's primary vehicle ("ArduPlane"/"ArduCopter"/"PX4"/…).
+    pub fc_variant: String,
+}
+
 /// Global application state managed by Tauri
 pub struct AppState {
-    /// Active protocol handler (None when disconnected)
-    pub protocol: Mutex<Option<ActiveProtocol>>,
-    /// Flight controller info from last successful handshake
-    pub fc_info: Mutex<Option<FcInfo>>,
+    /// Every open link (protocol handler + handshake info) and the active-vehicle selection. Replaces
+    /// the former single `protocol` / `fc_info` slots — see `vehicle_registry`.
+    pub links: Mutex<LinkRegistry>,
     /// Radar (foreign-vehicle tracking) subsystem — fully independent of `protocol`.
     pub radar: Mutex<RadarManager>,
     /// Bridge for scheduler-fed radar sources (ADS-B via MSP): the radar aggregator's ingest channel
@@ -66,8 +79,7 @@ impl AppState {
         let radar = RadarManager::new();
         let radar_ingest = radar.ingest_handle();
         Self {
-            protocol: Mutex::new(None),
-            fc_info: Mutex::new(None),
+            links: Mutex::new(LinkRegistry::new()),
             radar: Mutex::new(radar),
             radar_ingest,
             radar_msp_enabled: Arc::new(AtomicBool::new(false)),
@@ -81,3 +93,37 @@ impl AppState {
         }
     }
 }
+
+impl AppState {
+    /// Resolve a MAVLink command target. `vehicle_id` is the frontend's `"L1:S1"` key, or `None` for the
+    /// active vehicle. Errors keep the legacy texts ("Not connected", "FC is not running MAVLink").
+    pub fn mav_target(&self, vehicle_id: Option<&str>) -> Result<MavTarget, String> {
+        let reg = self.links.lock().map_err(|e| e.to_string())?;
+        let (entry, sysid) = reg.resolve(vehicle_id)?;
+        match &entry.protocol {
+            ActiveProtocol::Mavlink(h) => Ok(MavTarget {
+                cmd_tx: h.cmd_tx_clone(),
+                sysid,
+                fc_variant: h.fc_variant.clone(),
+            }),
+            _ => Err("FC is not running MAVLink".into()),
+        }
+    }
+
+    /// Like `mav_target` but `Ok(None)` for non-MAVLink / disconnected — for the fence/rally readers
+    /// that answer with an empty config instead of an error.
+    pub fn mav_target_opt(&self, vehicle_id: Option<&str>) -> Result<Option<MavTarget>, String> {
+        match self.mav_target(vehicle_id) {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if e == crate::vehicle_registry::ERR_NOT_CONNECTED || e == "FC is not running MAVLink" => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The active link's handshake info, if connected.
+    #[allow(dead_code)] // Phase C (link status / relay per-vehicle)
+    pub fn active_fc_info(&self) -> Option<FcInfo> {
+        self.links.lock().ok().and_then(|r| r.active_fc_info().cloned())
+    }
+}
+

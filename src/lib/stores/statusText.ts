@@ -7,6 +7,7 @@
 // audio cue. Severity is MAV_SEVERITY (0 = emergency … 7 = debug).
 
 import { writable, get } from 'svelte/store';
+import { isActive } from '$lib/stores/vehicles';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { settings } from './settings';
 
@@ -176,6 +177,7 @@ export function pushLocalStatus(severity: number, text: string): void {
 export async function startStatusText(): Promise<void> {
   if (unlisten) return;
   unlisten = await listen<{ severity: number; text: string }>('mavlink-statustext', (e) => {
+    if (!isActive(e.payload)) return; // other vehicles' messages get their own surface in Phase B
     trackPrearm(e.payload.text); // unfiltered — drives the arming indicator regardless of toast settings
     push(e.payload.severity, e.payload.text);
   });

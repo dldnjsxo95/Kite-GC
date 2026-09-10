@@ -65,7 +65,7 @@
   import { gcsLocation, gcsAccuracyM } from "$lib/stores/gcsLocation";
   import { fetchAero } from "$lib/stores/airspace";
   import { PlaybackController } from '$lib/controllers/playbackController';
-  import { refreshSerialPorts, connectFC, disconnectFC, startBleScan, stopBleScan, startBleDeviceListener, stopBleDeviceListener, clearBleDevices } from '$lib/controllers/connectionController';
+  import { refreshSerialPorts, connectFC, disconnectFC, startBleScan, stopBleScan, startBleDeviceListener, stopBleDeviceListener, clearBleDevices, disconnectLink, recoverBackendLinks } from '$lib/controllers/connectionController';
   import * as logbookCtrl from '$lib/controllers/logbookController';
   import * as widgetCtrl from '$lib/controllers/widgetController';
   import * as phoneCtrl from '$lib/controllers/phoneWidgetController';
@@ -88,8 +88,9 @@
   import { haversineDistance, bearing, destinationPoint } from '$lib/utils/geo';
   import { buildMissionInput } from '$lib/helpers/missionLibrary';
   import { buildArduMissionInput } from '$lib/helpers/missionLibraryArdu';
-  import { homePosition } from '$lib/stores/home';
-  import { ingestFcGuidedTarget } from '$lib/controllers/vehicleControl';
+  import { homePosition, setVehicleHome } from '$lib/stores/home';
+  import { isActive, links } from '$lib/stores/vehicles';
+  import { ingestFcGuidedTarget, ingestVehicleGuidedTarget } from '$lib/controllers/vehicleControl';
   import { MAP_PROVIDERS } from "$lib/config/mapProviders";
   import { tileCacheStats, setCacheMaxMB, clearCache } from "$lib/cache/tileCache";
   import { weatherTempDisplayFromC, weatherWindDisplayFromMs, weatherTempCFromDisplay, weatherWindMsFromDisplay, canonicalWeatherDescription } from "$lib/helpers/weather";
@@ -2650,7 +2651,11 @@
       });
     } catch (e) {
       errorMsg = String(e);
-      connection.set({ status: "error", protocolType: selectedProtocol, transportType: selectedTransport, port: "", baudRate: selectedBaud, errorMessage: String(e), fcInfo: null });
+      // Multi-vehicle: a failed attempt must not paint the UI "disconnected" while other links are up.
+      const stillUp = await recoverBackendLinks().catch(() => false);
+      if (!stillUp) {
+        connection.set({ status: "error", protocolType: selectedProtocol, transportType: selectedTransport, port: "", baudRate: selectedBaud, errorMessage: String(e), fcInfo: null });
+      }
     } finally {
       isConnecting = false;
     }
@@ -2659,6 +2664,8 @@
   async function initPage() {
     await startBleDeviceListener(); // live BLE discovery → bleDevices store
     await loadInfo();
+    // Links the backend still holds (page reload / a UI state that drifted) → show them as connected.
+    void recoverBackendLinks().catch(() => {});
     try {
       defaultFlightLogPath = await getDefaultFlightlogPath();
     } catch {
@@ -3267,7 +3274,13 @@
     );
     // The device vanished (fatal transport error) — the backend tore the scheduler down. Clean up the
     // connection state so the UI shows disconnected and the user can simply reconnect.
-    void listen('connection-lost', () => {
+    void listen<{ linkId?: number }>('connection-lost', (event) => {
+      // Multi-vehicle: with other links still up, only close the one that died.
+      const lid = event.payload?.linkId;
+      if (lid != null && get(links).length > 1) {
+        void disconnectLink(lid, selectedBaud).catch(() => {});
+        return;
+      }
       if (document.hidden) lostWhileHidden = true;
       void disconnectFC(selectedBaud).catch(() => {});
     });
@@ -3310,9 +3323,13 @@
     });
     // Home from the FC (MSP_WP 0), pushed once at connect — recovers Home on a mid-flight connect /
     // app restart. The live arm-transition path (Map.svelte) overwrites it on the next arm.
-    void listen<{ lat: number; lon: number; alt: number }>('home-position', (event) => {
+    void listen<{ lat: number; lon: number; alt: number; vehicleId?: string }>('home-position', (event) => {
       const { lat, lon, alt } = event.payload;
       if (lat === 0 && lon === 0) return;
+      // Every vehicle's home is kept by id (fleet map + re-seed on switch); only the active one
+      // drives the singleton home / launch reference below.
+      if (event.payload.vehicleId) setVehicleHome(event.payload.vehicleId, lat, lon, alt);
+      if (!isActive(event.payload)) return;
       // The FC re-broadcasts HOME_POSITION (ArduPilot ~0.2 Hz), often with sub-metre jitter. Re-setting
       // the stores on every tick churns every subscriber — writable stores emit even on an identical
       // value — and the 3D mission overlay rebuilds, flickering its polylines. Only update on a real move.
@@ -3327,7 +3344,11 @@
     });
     // FC-confirmed Guided target (POSITION_TARGET_GLOBAL_INT, 1 Hz) — the controller gates it on the
     // FC actually being in its guided mode (in AUTO/RTL the same message carries the mission WP/home).
-    void listen<{ lat: number; lon: number; alt: number }>('guided-target', (event) => {
+    void listen<{ lat: number; lon: number; alt: number; vehicleId?: string }>('guided-target', (event) => {
+      // Every vehicle's target feeds the fleet map ("who is heading where"); only the active one
+      // drives the Guided UI.
+      if (event.payload.vehicleId) ingestVehicleGuidedTarget(event.payload.vehicleId, event.payload.lat, event.payload.lon);
+      if (!isActive(event.payload)) return;
       ingestFcGuidedTarget(event.payload.lat, event.payload.lon);
     });
   }
