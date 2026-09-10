@@ -100,7 +100,7 @@ pub fn fence_write_all(vehicle_id: Option<String>, config: FenceConfig, state: S
     if items.is_empty() {
         mavlink_proto::mission::clear(&cmd_tx, fc_sysid, MavMissionType::MAV_MISSION_TYPE_FENCE)?;
     } else {
-        mavlink_proto::mission::upload(&cmd_tx, fc_sysid, &items, false, MavMissionType::MAV_MISSION_TYPE_FENCE, |_, _| {})?;
+        mavlink_proto::mission::upload(&cmd_tx, fc_sysid, &items, false, MavMissionType::MAV_MISSION_TYPE_FENCE, false, |_, _| {})?;
     }
     for p in &config.params {
         control::set_param(&cmd_tx, fc_sysid, &p.name, p.value)?;
