@@ -261,6 +261,7 @@ pub async fn connect(
     };
 
     let transport_desc = byte_transport.description().to_string();
+    let transport_note = byte_transport.diagnostic_note();
     log::info!("Transport opened, protocol={} link=L{} ({})", proto, link_id, transport_desc);
 
     // One link per endpoint. A second socket talking to the same UDP/TCP peer (or the same serial
@@ -347,7 +348,14 @@ pub async fn connect(
         }
         Err(e) => {
             log::error!("Connection failed (protocol={}): {}", proto, e);
-            return Err(e);
+            // A transport-level explanation (busy local UDP port → the vehicles' pushes go elsewhere)
+            // turns a bare "no HEARTBEAT" into something the user can act on.
+            return Err(match transport_note {
+                Some(note) => format!("{e}
+
+{note}"),
+                None => e,
+            });
         }
     };
 
