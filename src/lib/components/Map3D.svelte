@@ -46,6 +46,7 @@
   import { homePosition, homeLocked, vehicleHomes, type HomePosition, type VehicleHome } from "$lib/stores/home";
   import { allTelemetry, type TelemetryData } from "$lib/stores/telemetry";
   import { vehicles, activeVehicleId, type VehicleSummary } from "$lib/stores/vehicles";
+  import { selectedVehicleIds, toggleSelected } from "$lib/stores/fleetSelection";
   import { switchVehicle } from "$lib/controllers/connectionController";
   import { guidedTargets, guidedActive, activeMode } from "$lib/controllers/vehicleControl";
   import { matchActiveMode } from "$lib/helpers/mavModes";
@@ -90,7 +91,7 @@
   import { cmdHasLocation, cmdStandaloneCoordinate, cmdIsTakeoff } from "$lib/helpers/arduCommandCatalog";
   import { arduWpIconSpec } from "$lib/helpers/missionIconsArdupilot";
   import { autopilotSystem, type AutopilotSystem } from "$lib/stores/autopilotContext";
-  import { frameMissionSignal } from "$lib/stores/mapCamera";
+  import { frameMissionSignal, frameFleetSignal } from "$lib/stores/mapCamera";
   import { activeWpNumber } from "$lib/stores/navStatus";
   import {
     buildDisplayNumbers, isFlightPathWp, findMissionEndIndex, findPreviousGeoWp,
@@ -354,7 +355,8 @@
 
   // Camera mode: free (no lock) | follow (smooth chase) | orbit (locked target, free orbit)
   //            | fpv (first-person: camera replaces the model, follows all axes)
-  type Camera3DMode = 'free' | 'follow' | 'orbit' | 'fpv';
+  //            | fleet (frame every connected vehicle — or the 2+ selected ones — and keep them in view)
+  type Camera3DMode = 'free' | 'fleet' | 'follow' | 'orbit' | 'fpv';
   let cameraMode = $state<Camera3DMode>('free');
 
   // ── FPV (first-person view) ──
@@ -888,6 +890,7 @@
       if (q) updateFpvCamera(q, pToLat, pToLon, pToAlt);
     } else if (cameraMode === 'follow') updateChaseCamera(pToLat, pToLon, pToAlt, aToHead);
     else if (cameraMode === 'orbit') updateOrbitCamera(pToLat, pToLon, pToAlt);
+    else if (cameraMode === 'fleet') fitFleet3D(true);
     viewer?.scene.requestRender();
   }
 
@@ -1518,6 +1521,11 @@
       const id = radarPickId(e.position);
       if (id != null) radarSelection.update((cur) => (cur === id ? null : id));
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    // Ctrl+click on a fleet vehicle toggles it in the group selection (same gesture as the 2D map).
+    radar3dPickHandler.setInputAction((e: Cesium.ScreenSpaceEventHandler.PositionedEvent) => {
+      const vid = fleet3dPickId(e.position);
+      if (vid != null) toggleSelected(vid);
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK, Cesium.KeyboardEventModifier.CTRL);
     radar3dPickHandler.setInputAction((e: Cesium.ScreenSpaceEventHandler.MotionEvent) => {
       if (viewer) viewer.canvas.style.cursor = (fleet3dPickId(e.endPosition) != null || radarPickId(e.endPosition) != null) ? 'pointer' : '';
     }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
@@ -1802,15 +1810,20 @@
     home?: Cesium.Entity;
     target?: Cesium.Entity;
     line?: Cesium.Entity;
+    /** Group-selection ring under the craft (stores/fleetSelection). */
+    ring?: Cesium.Entity;
     mission?: Cesium.Entity[];
     missionKey?: string;
     color: string;
   }
   const fleet3d = new Map<string, Fleet3dRec>();
+  const FLEET3D_RING_RADIUS_M = 8;
   const fleet3dEntityIds = new WeakMap<Cesium.Entity, string>();
   let fleet3dTelem: ReadonlyMap<string, TelemetryData> = new Map();
   let fleet3dKnown: Map<string, VehicleSummary> = new Map();
   let fleet3dActive: string | null = null;
+  let fleet3dSelected: ReadonlySet<string> = new Set();
+  let fleet3dCount = $state(0); // reactive registry size (the fleet camera step needs 2+)
   let fleet3dTargets: ReadonlyMap<string, { lat: number; lon: number; ts: number }> = new Map();
   let fleet3dHomes: ReadonlyMap<string, VehicleHome> = new Map();
   let fleet3dMissions: ReadonlyMap<string, ArduWaypoint[]> = new Map();
@@ -1856,6 +1869,7 @@
     const now = Date.now();
     const seen = new Set<string>();
     const tr = get(t);
+    if (cameraMode === 'fleet') fitFleet3D(false); // keep every (selected) vehicle in view
     ordered.forEach((v, idx) => {
       const tv = fleet3dTelem.get(v.vehicleId);
       if (!tv || !tv.lastUpdate || !isValidGpsCoordinate(tv.lat, tv.lon)) return;
@@ -1870,6 +1884,28 @@
       const alt = Math.max(altMsl + geoidOffset, 0);
       const position = Cesium.Cartesian3.fromDegrees(tv.lon, tv.lat, alt);
       const armed = (tv.armingFlags & (1 << ARMING_FLAG_ARMED)) !== 0;
+
+      // Group-selection ring (active vehicle included — its main entity has no other selection cue).
+      if (fleet3dSelected.has(v.vehicleId)) {
+        if (!rec.ring) {
+          rec.ring = vw.entities.add({
+            position,
+            ellipse: {
+              semiMajorAxis: FLEET3D_RING_RADIUS_M, semiMinorAxis: FLEET3D_RING_RADIUS_M,
+              height: alt, material: cesColor.withAlpha(0.35),
+              outline: true, outlineColor: Cesium.Color.WHITE.withAlpha(0.9),
+            },
+          });
+        } else {
+          (rec.ring.position as Cesium.ConstantPositionProperty).setValue(position);
+          if (rec.ring.ellipse) {
+            rec.ring.ellipse.height = new Cesium.ConstantProperty(alt);
+            rec.ring.ellipse.material = new Cesium.ColorMaterialProperty(cesColor.withAlpha(0.35));
+          }
+        }
+      } else if (rec.ring) {
+        fleet3dRemove(rec, ['ring']);
+      }
 
       if (isActiveVehicle) {
         // The main UAV entity / live trail / home marker already show this vehicle.
@@ -1993,14 +2029,14 @@
     // Vehicles that are gone (or have no fix yet) lose their entities; a disconnect-all keeps the last picture.
     if (fleet3dKnown.size > 0) {
       for (const [id, rec] of fleet3d) {
-        if (!fleet3dKnown.has(id)) { fleet3dRemove(rec, ['model', 'trail', 'home', 'target', 'line']); for (const e of rec.mission ?? []) vw.entities.remove(e); fleet3d.delete(id); }
+        if (!fleet3dKnown.has(id)) { fleet3dRemove(rec, ['model', 'trail', 'home', 'target', 'line', 'ring']); for (const e of rec.mission ?? []) vw.entities.remove(e); fleet3d.delete(id); }
       }
     }
     vw.scene.requestRender();
   }
   /** A new session after a disconnect-all: the previous fleet's picture goes. */
   function clearFleet3D() {
-    for (const rec of fleet3d.values()) { fleet3dRemove(rec, ['model', 'trail', 'home', 'target', 'line']); for (const e of rec.mission ?? []) viewer?.entities.remove(e); }
+    for (const rec of fleet3d.values()) { fleet3dRemove(rec, ['model', 'trail', 'home', 'target', 'line', 'ring']); for (const e of rec.mission ?? []) viewer?.entities.remove(e); }
     fleet3d.clear();
   }
   const unsubFleet3d: (() => void)[] = [
@@ -2008,10 +2044,16 @@
     vehicles.subscribe((v) => {
       const wasEmpty = fleet3dKnown.size === 0;
       fleet3dKnown = v;
+      fleet3dCount = v.size;
       if (wasEmpty && v.size > 0 && viewer) clearFleet3D();
+      if (v.size < 2 && cameraMode === 'fleet') cameraMode = 'free'; // fleet camera needs 2+
       if (viewer) updateFleet3D();
     }),
     activeVehicleId.subscribe((v) => { fleet3dActive = v; if (viewer) updateFleet3D(); }),
+    selectedVehicleIds.subscribe((s) => { fleet3dSelected = s; if (viewer) updateFleet3D(); }),
+    frameFleetSignal.subscribe((n) => {
+      if (n > 0 && viewer && active && (cameraMode === 'free' || cameraMode === 'fleet')) fitFleet3D(true);
+    }),
     guidedTargets.subscribe((v) => { fleet3dTargets = v; if (viewer) updateFleet3D(); }),
     vehicleHomes.subscribe((v) => { fleet3dHomes = v; if (viewer) updateFleet3D(); }),
     arduMissionsByVehicle.subscribe((v) => { fleet3dMissions = v; if (viewer) updateFleet3D(); }),
@@ -4960,10 +5002,69 @@
     cameraMode = 'free';
   }
 
+  // ── Fleet camera: frame every connected vehicle (or the 2+ selected ones) ──────────────────────
+  // Re-flies only when a vehicle has left the view or the fleet's extent changed by ~a third, at most
+  // once a second, so the 10 Hz telemetry flush doesn't keep the camera in perpetual motion.
+  let fleetFitLastMs = 0;
+  let fleetFitLastRadius = 0;
+  const FLEET3D_FIT_MIN_INTERVAL_MS = 1000;
+  const FLEET3D_SINGLE_RADIUS_M = 150;
+  function fleet3dFitPoints(): Cesium.Cartesian3[] {
+    const useSelection = fleet3dSelected.size >= 2;
+    const pts: Cesium.Cartesian3[] = [];
+    for (const v of fleet3dKnown.values()) {
+      if (useSelection && !fleet3dSelected.has(v.vehicleId)) continue;
+      const tv = fleet3dTelem.get(v.vehicleId);
+      if (!tv || !tv.lastUpdate || !isValidGpsCoordinate(tv.lat, tv.lon)) continue;
+      const altMsl = resolveTrueMsl(tv.altMsl, get(altReference), get(groundAnchor)) ?? tv.altMsl ?? tv.altitude;
+      pts.push(Cesium.Cartesian3.fromDegrees(tv.lon, tv.lat, Math.max(altMsl + geoidOffset, 0)));
+    }
+    return pts;
+  }
+  function fitFleet3D(force: boolean) {
+    if (!viewer) return;
+    const pts = fleet3dFitPoints();
+    if (pts.length === 0) return;
+    const now = Date.now();
+    const sphere = pts.length === 1
+      ? new Cesium.BoundingSphere(pts[0], FLEET3D_SINGLE_RADIUS_M)
+      : Cesium.BoundingSphere.fromPoints(pts);
+    const cam = viewer.camera;
+    if (!force) {
+      if (now - fleetFitLastMs < FLEET3D_FIT_MIN_INTERVAL_MS) return;
+      const cv = cam.frustum.computeCullingVolume(cam.position, cam.direction, cam.up);
+      const outside = pts.some((p) => cv.computeVisibility(new Cesium.BoundingSphere(p, 30)) === Cesium.Intersect.OUTSIDE);
+      const shrunk = fleetFitLastRadius > 0 && sphere.radius < fleetFitLastRadius * 0.6;
+      const grown = fleetFitLastRadius > 0 && sphere.radius > fleetFitLastRadius * 1.3;
+      if (!outside && !shrunk && !grown) return;
+    }
+    fleetFitLastMs = now;
+    fleetFitLastRadius = sphere.radius;
+    // Keep the operator's heading; never flatter than -20° so the whole fleet stays on screen.
+    const pitch = Math.min(cam.pitch, Cesium.Math.toRadians(-20));
+    cam.flyToBoundingSphere(sphere, {
+      duration: force ? 1.0 : 0.8,
+      offset: new Cesium.HeadingPitchRange(cam.heading, pitch, 0), // range 0 = fit the sphere
+    });
+  }
+  function enterFleetCamera() {
+    cameraMode = 'fleet';
+    setFollowCameraControls(false);
+    chaseLerpActive = false;
+    chaseInited = false;
+    orbitLerpActive = false;
+    orbitInited = false;
+    viewer?.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+    fleetFitLastMs = 0;
+    fleetFitLastRadius = 0;
+    fitFleet3D(true);
+  }
+
   function cycleCameraMode() {
     if (cameraMode === 'orbit') { enterFpv(); return; }
     if (cameraMode === 'fpv') { exitFpv(); return; }
-    if (cameraMode === 'free') {
+    if (cameraMode === 'free' && fleet3dCount >= 2) { enterFleetCamera(); return; }
+    if (cameraMode === 'free' || cameraMode === 'fleet') {
       cameraMode = 'follow';
       lockRange = 200;
       followPitch = -20 * (Math.PI / 180);
@@ -5060,6 +5161,7 @@
 
   const camModeTitle = $derived(
     cameraMode === 'free'   ? 'Camera: Free'        :
+    cameraMode === 'fleet'  ? 'Camera: Fleet (frame all vehicles)' :
     cameraMode === 'follow' ? 'Camera: Follow UAV'  :
     cameraMode === 'orbit'  ? 'Camera: Orbit UAV'   :
                               'Camera: FPV (first-person)'
@@ -5105,11 +5207,19 @@
       class:mode-follow={cameraMode === 'follow'}
       class:mode-orbit={cameraMode === 'orbit'}
       class:mode-fpv={cameraMode === 'fpv'}
+      class:mode-fleet={cameraMode === 'fleet'}
       onclick={cycleCameraMode}
       title={camModeTitle}
       aria-label={camModeTitle}
     >
-      {#if cameraMode === 'follow'}
+      {#if cameraMode === 'fleet'}
+        <svg class="cam-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+          <path d="M3 8V4h4M17 4h4v4M21 16v4h-4M7 20H3v-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <polygon points="12,7 9.6,13 12,11.8 14.4,13" fill="currentColor"/>
+          <polygon points="7.5,12 5.1,18 7.5,16.8 9.9,18" fill="currentColor"/>
+          <polygon points="16.5,12 14.1,18 16.5,16.8 18.9,18" fill="currentColor"/>
+        </svg>
+      {:else if cameraMode === 'follow'}
         <svg class="cam-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
           <polygon points="12,6 7.5,17.5 12,15.2 16.5,17.5" fill="currentColor"/>
         </svg>
@@ -5235,6 +5345,11 @@
   }
 
   /* Follow = full blue (smooth chase) */
+  .map-cam-btn.mode-fleet {
+    background: rgba(55, 168, 219, 0.35);
+    border-color: #37a8db;
+    color: #fff;
+  }
   .map-cam-btn.mode-follow {
     background: rgba(46, 46, 46, 0.92);
     border-color: rgba(55, 168, 219, 0.7);

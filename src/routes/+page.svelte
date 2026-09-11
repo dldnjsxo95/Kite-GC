@@ -48,6 +48,12 @@
   import LogbookPanel from "$lib/components/logbook/LogbookPanel.svelte";
   import MissionPanel from "$lib/components/mission/MissionPanel.svelte";
   import MavCommandPanel from "$lib/components/control/MavCommandPanel.svelte";
+  import FleetPanel from "$lib/components/FleetPanel.svelte";
+  import GroupCommandBar from "$lib/components/GroupCommandBar.svelte";
+  import { vehicles } from "$lib/stores/vehicles";
+  import { isMavlinkVehicle } from "$lib/helpers/fleetStatus";
+  import { selectedVehicleIds } from "$lib/stores/fleetSelection";
+  import { navTabRequest } from "$lib/stores/navRequest";
   import RcControlPanel from "$lib/components/control/RcControlPanel.svelte";
   import VirtualSticks from "$lib/components/control/VirtualSticks.svelte";
   import VideoPanel from "$lib/components/video/VideoPanel.svelte";
@@ -199,7 +205,7 @@
   }
   // 2D follow state, lifted here so it survives the 2D map's remount on each 2D↔3D toggle
   // (the 3D camera mode persists on its own since Map3D stays mounted).
-  let map2dViewMode = $state<'free' | 'follow' | 'heading-follow'>('free');
+  let map2dViewMode = $state<'free' | 'follow' | 'heading-follow' | 'fleet'>('free');
 
   function toggleMapView() {
     if (mapViewMode === '3d') {
@@ -391,7 +397,7 @@
   const miniMapLocked = $derived(mapInFrame && (mapInWidget || phoneUi));
   let miniLockActive = false;
   let savedMapViewMode: '2d' | '3d' = '2d';
-  let savedMode2d: 'free' | 'follow' | 'heading-follow' = 'free';
+  let savedMode2d: 'free' | 'follow' | 'heading-follow' | 'fleet' = 'free';
   $effect(() => {
     const lock = miniMapLocked;
     untrack(() => {
@@ -833,6 +839,8 @@
   const ICON_MISSION = '<svg viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2.5C8.4 2.5 5.5 5.4 5.5 9c0 4.8 6.5 12.5 6.5 12.5S18.5 13.8 18.5 9c0-3.6-2.9-6.5-6.5-6.5Zm0 4.1A2.4 2.4 0 1 0 12 11.4 2.4 2.4 0 0 0 12 6.6Z"/></svg>';
   // Two solid peaks, slightly raised (Terrain).
   const ICON_TERRAIN = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M1.5 20 8.5 5 13 14 16.5 8.5 22.5 20Z"/></svg>';
+  // Fleet (multi-vehicle list + group commands): three craft arrows inside a corner frame.
+  const ICON_FLEET = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8V4h4M17 4h4v4M21 16v4h-4M7 20H3v-4"/><polygon points="12,7 9.6,13 12,11.8 14.4,13" fill="currentColor" stroke="none"/><polygon points="7.5,12 5.1,18 7.5,16.8 9.9,18" fill="currentColor" stroke="none"/><polygon points="16.5,12 14.1,18 16.5,16.8 18.9,18" fill="currentColor" stroke="none"/></svg>';
   // Solid flat movie camera (Video): two reels + body + lens funnel.
   const ICON_VIDEO = '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="7" cy="7" r="2.9"/><circle cx="12.6" cy="7" r="2.9"/><rect x="2.5" y="9.5" width="13" height="9" rx="1.6"/><path d="M15.5 12 21.5 9.5V18.5L15.5 16Z"/></svg>';
   // Radar dish on a mast with two sweep arcs (Radar / foreign-vehicle tracking).
@@ -878,6 +886,7 @@
     { id: "uav-info", label: () => $t('nav.uavInfo'), icon: ICON_UAV_INFO },
     { id: "mission", label: () => $t('nav.mission'), icon: ICON_MISSION },
     { id: "control", label: () => $t('nav.control'), icon: ICON_CONTROL },
+    { id: "fleet", label: () => $t('nav.fleet'), icon: ICON_FLEET },
     { id: "rc-control", label: () => $t('nav.rc'), icon: ICON_RC },
     { id: "terrain", label: () => $t('nav.terrain'), icon: ICON_TERRAIN },
     { id: "logbook", label: () => $t('nav.logbook'), icon: ICON_LOGBOOK },
@@ -891,10 +900,14 @@
   const geozonesAvailable = $derived($geozoneWorking?.has_geozones ?? false);
   const fenceAvailable = $derived($fenceWorking?.has_fence ?? false);
   const rallyAvailable = $derived($rallyWorking?.has_rally ?? false);
+  // Fleet tab: as soon as one MAVLink vehicle is known (so a single-vehicle operator discovers the
+  // list); the group command bar itself only appears with 2+ (see GroupCommandBar).
+  const fleetTabAvailable = $derived([...$vehicles.values()].some(isMavlinkVehicle));
   const tabs = $derived(
     allTabs.filter(t =>
       (t.id !== 'logbook' || flightLoggingEnabled) &&
       (t.id !== 'control' || isMavlinkConnected) && // control tab only when connected via MAVLink
+      (t.id !== 'fleet' || fleetTabAvailable) &&
       (t.id !== 'rc-control' || (rcTabAvailable && !isMobile) || mobileRcAvailable) && // RC tab: desktop needs the master switch + a joystick; mobile uses on-screen sticks when a FC is connected
       (t.id !== 'radar' || radarSettings.enabled) && // radar tab only when the master switch is on
       (t.id !== 'airspace' || airspaceSettings.enabled || geozonesAvailable || fenceAvailable || rallyAvailable) // airspace: master switch, or geozone (INAV) / fence+rally (MAVLink) capable FC
@@ -1348,6 +1361,41 @@
     }
   }
 
+  // ── Fleet auto-switch: 2+ vehicles selected → open the Fleet tab; back under 2 → return to where the
+  // operator was. A manual tab change in between cancels the return (selectTab clears the memo).
+  let autoFleetPrevTab: string | null = null;
+  let autoFleetSwitching = false;
+  let lastSelCount = 0;
+  $effect(() => {
+    const n = $selectedVehicleIds.size;
+    untrack(() => {
+      if (n >= 2 && lastSelCount < 2 && activeTab !== 'fleet' && fleetTabAvailable) {
+        autoFleetPrevTab = terrainOpen ? 'terrain' : activeTab;
+        autoFleetSwitching = true;
+        try { selectTab('fleet'); } finally { autoFleetSwitching = false; }
+      } else if (n < 2 && lastSelCount >= 2 && autoFleetPrevTab && activeTab === 'fleet' && !terrainOpen) {
+        const back = autoFleetPrevTab;
+        autoFleetPrevTab = null;
+        autoFleetSwitching = true;
+        try { selectTab(back); } finally { autoFleetSwitching = false; }
+      }
+      lastSelCount = n;
+    });
+  });
+
+  // Tab requests from panels that don't own this state (fleet panel → mission editor).
+  $effect(() => {
+    const r = $navTabRequest;
+    if (!r) return;
+    untrack(() => {
+      // selectTab on the already-visible active tab would HIDE it (the re-click gesture) — a request
+      // means "show it", so only act when it isn't already on screen.
+      const isActive = terrainOpen ? r.tabId === 'terrain' : r.tabId === activeTab;
+      if (isActive && navPanelOpen && !panelHidden) return;
+      selectTab(r.tabId);
+    });
+  });
+
   function selectTab(tabId: string) {
     // Re-clicking the ACTIVE tab's button hides its panel without touching its state (the mission
     // edit mode stays armed, a half-typed form survives): the panel slides out to the left and the
@@ -1368,6 +1416,8 @@
     // Selecting another tab switches away from the terrain overlay
     patchTerrainAnalysis({ open: false });
     if (tabId !== 'mission') editMode.set(false);
+    // A manual tab choice ends the fleet auto-switch (see the selection effect below).
+    if (!autoFleetSwitching && tabId !== 'fleet') autoFleetPrevTab = null;
     activeTab = tabId;
     settings.patch({ activeTab });
     if (tabId === 'logbook') {
@@ -3509,6 +3559,8 @@
     <RadarAlertBanner {interfaceSettings} />
     <!-- FC system messages (MAVLink STATUSTEXT) as top-edge toasts (renders nothing when idle). -->
     <StatusTextToasts />
+    <!-- Multi-vehicle group commands, bottom-centre (renders nothing with fewer than 2 MAVLink vehicles). -->
+    <GroupCommandBar />
   </div>
 
   <!-- Floating-frame map controls — top-level/unzoomed so they sit ABOVE the in-frame map (z2); the
@@ -4025,6 +4077,8 @@
           <MissionPanel />
         {:else if activeTab === 'control'}
           <MavCommandPanel />
+        {:else if activeTab === 'fleet'}
+          <FleetPanel />
         {:else if activeTab === 'rc-control'}
           {#if isMobile}
             <VirtualSticks />

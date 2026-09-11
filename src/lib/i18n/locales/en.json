@@ -166,6 +166,7 @@
   },
   "nav": {
     "uavInfo": "UAV Info",
+    "fleet": "Fleet",
     "settings": "Settings",
     "logbook": "Logbook",
     "mission": "Mission",
@@ -352,6 +353,114 @@
     "saved": "Saved to FC.",
     "saveFailed": "Save failed: {error}"
   },
+  "fleet": {
+    "title": "Fleet",
+    "empty": "No vehicles connected.",
+    "selectLabel": "Select",
+    "selectAll": "All",
+    "selectArmed": "Armed",
+    "selectFlying": "Flying",
+    "selectNone": "None",
+    "selectedCount": "{n} selected",
+    "frame": "Frame fleet",
+    "frameHint": "Fit every vehicle (or the selected ones) into the map view",
+    "active": "Active",
+    "armed": "Armed",
+    "disarmed": "Disarmed",
+    "link": {
+      "ok": "Link OK",
+      "stale": "Link stale",
+      "lost": "Link lost"
+    },
+    "col": {
+      "select": "Select for group commands",
+      "battery": "Battery",
+      "sats": "GPS satellites",
+      "alt": "Relative altitude",
+      "speed": "Ground speed"
+    },
+    "warn": {
+      "lowBattery": "Low battery",
+      "linkLost": "Link lost",
+      "failsafe": "Failsafe"
+    },
+    "switchHint": "Click a row to make that vehicle active. Ctrl+click (or the checkbox) adds it to the group selection.",
+    "group": {
+      "title": "Group command",
+      "section": "Group commands",
+      "hint": "Select 2 or more vehicles for group commands",
+      "rtlAll": "RTL ALL",
+      "rtlAllHint": "Emergency: return every armed vehicle to launch",
+      "noArmed": "No armed vehicles",
+      "mode": "Mode…",
+      "modeSelect": "Select mode…",
+      "send": "Hold to send to {n}",
+      "sendNone": "No vehicles included",
+      "include": "Include",
+      "altitude": "Takeoff altitude (m)",
+      "stagger": "Stagger between vehicles (s)",
+      "speed": "Speed (m/s)",
+      "targets": "Targets",
+      "busy": "Group command in progress…",
+      "lastRun": "Last group command",
+      "retryFailed": "Retry failed",
+      "clearSelection": "Clear selection"
+    },
+    "kind": {
+      "arm": "Arm",
+      "disarm": "Disarm",
+      "takeoff": "Takeoff",
+      "land": "Land",
+      "rtl": "RTL",
+      "hold": "Hold",
+      "missionStart": "Mission",
+      "changeSpeed": "Speed",
+      "setMode": "Set mode",
+      "missionUpload": "Upload mission"
+    },
+    "mission": {
+      "wps": "{n} WP",
+      "none": "No mission",
+      "fc": "FC",
+      "fcTip": "This vehicle holds exactly this plan",
+      "modified": "Modified",
+      "modifiedTip": "Edited since the last upload / save",
+      "current": "WP {n}",
+      "edit": "Edit this vehicle's mission",
+      "uploadHint": "Sends the plan currently in the mission editor to every selected vehicle, one after another. A spacing offsets each vehicle's copy along the bearing.",
+      "offset": "Spacing between vehicles (m)",
+      "offsetBearing": "Spacing bearing (°)"
+    },
+    "intent": {
+      "hold": "Hold / Loiter",
+      "return": "Return",
+      "mission": "Mission",
+      "land": "Land",
+      "guided": "Guided"
+    },
+    "check": {
+      "notMavlink": "Not a MAVLink vehicle",
+      "unknownFirmware": "Unsupported firmware",
+      "linkLost": "Link lost",
+      "linkStale": "Telemetry stale",
+      "alreadyArmed": "Already armed",
+      "notArmed": "Not armed",
+      "noGpsFix": "No 3D GPS fix",
+      "lowBattery": "Battery below 20 %",
+      "prearmBlocked": "Pre-arm checks failing",
+      "modeUnsupported": "Mode not available on this vehicle",
+      "armedUpload": "Vehicle is armed — replaces its mission in flight",
+      "cmdInvalid": "Plan has commands this vehicle type does not support",
+      "emptyPlan": "The mission editor is empty"
+    },
+    "status": {
+      "pending": "Pending",
+      "running": "Sending…",
+      "ok": "Accepted",
+      "fail": "Failed",
+      "skipped": "Skipped"
+    }
+  },
   "control": {
     "title": "Vehicle Control",
     "notConnected": "Connect via MAVLink (ArduPilot / PX4) to command the vehicle.",
@@ -380,6 +489,7 @@
     "flyHere": "Fly Here",
     "guidedTarget": "Guided target",
     "setWpHint": "Sync the mission with the FC (download/upload) to enable.",
+    "startNotSyncedHint": "The plan on screen differs from the mission on the FC — the vehicle flies what the FC holds.",
     "ack": {
       "ok": "Accepted"
     },
@@ -1230,6 +1340,11 @@
     "clearConfirmTitle": "Clear mission",
     "clearConfirmMsg": "Remove all waypoints of this mission? This can be undone with Ctrl+Z.",
     "clearConfirmYes": "Clear",
+    "selectAllHint": "Ctrl+A selects every waypoint; drag one selected marker to move them all. Ctrl+drag on the map draws a selection box.",
+    "dragReorderHint": "Drag a row to change the order",
+    "uploadInvalidTitle": "Upload with unsupported commands?",
+    "uploadInvalidMsg": "{count} command(s) in this plan are not supported by the connected vehicle type and may be rejected or ignored. Upload anyway?",
+    "uploadInvalidYes": "Upload",
     "addMission": "Add mission",
     "mission": "Mission",
     "moveToMission": "Move to mission",

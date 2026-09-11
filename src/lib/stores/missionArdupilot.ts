@@ -7,6 +7,7 @@ import { connection } from './connection';
 import { settings } from './settings';
 import { activeVehicleId, vehicles } from './vehicles';
 import { CMD, cmdHasLocation, type VehicleClass } from '$lib/helpers/arduCommandCatalog';
+import { translateWaypoints } from '$lib/helpers/missionGeo';
 
 // ── MAV_CMD constants ─────────────────────────────────────────────────
 export const MAV_CMD_NAV_WAYPOINT        = 16;
@@ -138,6 +139,21 @@ export function arduSelectWpRange(a: number, b: number): void {
 export function arduClearWpSelection(): void {
   arduSelectedWpIndices.set(new Set());
   arduSelectedWpIndex.set(-1);
+}
+
+/** Select every item (Ctrl+A in edit mode) — the "move the whole mission" entry point. */
+export function arduSelectAllWps(): void {
+  const n = new Set<number>();
+  get(arduMission).forEach((_, i) => n.add(i));
+  arduSelectedWpIndices.set(n);
+  syncArduPrimary(n);
+}
+
+/** Replace the selection with `indices` (box select on the map). */
+export function arduSetWpSelection(indices: Iterable<number>): void {
+  const n = new Set(indices);
+  arduSelectedWpIndices.set(n);
+  syncArduPrimary(n);
 }
 
 /** Batch-remove all selected waypoints (descending so indices stay valid), as one undo step. */
@@ -317,10 +333,11 @@ export function groupEndIndex(g: ArduGroup): number {
 // ── Mutations ─────────────────────────────────────────────────────────
 
 export function arduMissionClear(): void {
+  // Undoable (the confirm dialog promises Ctrl+Z) — a clear is a big, easy-to-regret step.
+  arduRecordUndo();
   arduMission.set([]);
   arduClearWpSelection();
   arduLoadedMissionId.set(null);
-  arduClearUndoHistory(); // a clear is a fresh baseline
 }
 
 export function arduAddWp(wp: ArduWaypoint): void {
@@ -352,6 +369,35 @@ export function arduMoveWp(from: number, to: number): void {
     next.splice(to, 0, item);
     return next;
   });
+}
+
+/** Translate the located waypoints among `indices` by a 1e7-degree delta — a group drag on the map or
+ *  a whole-mission move (Ctrl+A, then drag). One undo step. */
+export function arduTranslateWps(indices: ReadonlySet<number>, dLat1e7: number, dLon1e7: number): void {
+  if (indices.size === 0 || (dLat1e7 === 0 && dLon1e7 === 0)) return;
+  arduRecordUndo();
+  arduMission.update(wps => translateWaypoints(wps, dLat1e7, dLon1e7, indices));
+}
+
+/** Move a whole group (a location command + its trailing modifiers) so that it lands where the group
+ *  anchored at `toAnchorIdx` currently starts (`after` = behind that group instead). List drag-reorder. */
+export function arduMoveGroup(fromAnchorIdx: number, toAnchorIdx: number, after = false): void {
+  if (fromAnchorIdx === toAnchorIdx) return;
+  const wps = get(arduMission);
+  const groups = groupArduMission(wps);
+  const from = groups.find(g => g.anchorIdx === fromAnchorIdx);
+  const to = groups.find(g => g.anchorIdx === toAnchorIdx);
+  if (!from || !to) return;
+  const fromStart = from.anchorIdx;
+  const fromEnd = groupEndIndex(from); // exclusive
+  const block = wps.slice(fromStart, fromEnd);
+  const rest = [...wps.slice(0, fromStart), ...wps.slice(fromEnd)];
+  let insertAt = after ? groupEndIndex(to) : to.anchorIdx;
+  if (insertAt > fromStart) insertAt -= block.length; // indices shift once the block is pulled out
+  if (insertAt < 0 || insertAt > rest.length) return;
+  arduRecordUndo();
+  arduMission.set([...rest.slice(0, insertAt), ...block, ...rest.slice(insertAt)]);
+  arduClearWpSelection();
 }
 
 // ── Undo / redo ────────────────────────────────────────────────────────────
@@ -600,11 +646,56 @@ let arduSlotOwner: string | null = null;
 
 /** Every vehicle's mission (the active one live, the others as parked), for the fleet map layers. */
 export const arduMissionsByVehicle = writable<ReadonlyMap<string, ArduWaypoint[]>>(new Map());
+
+/** Per-vehicle plan status for the fleet panel: size + whether it still matches what that aircraft
+ *  holds (`fcSynced`) or has unsaved edits (`modified`). Computed from each slot's own snapshots. */
+export interface ArduVehicleMissionStatus {
+  count: number;
+  locationCount: number;
+  fcSynced: boolean;
+  modified: boolean;
+}
+export const arduMissionStatusByVehicle = writable<ReadonlyMap<string, ArduVehicleMissionStatus>>(new Map());
+
+function statusFor(wps: ArduWaypoint[], refs: Map<ArduSyncFlag, string>): ArduVehicleMissionStatus {
+  const count = wps.length;
+  const locationCount = wps.filter((w) => cmdHasLocation(w.command)).length;
+  if (count === 0) return { count, locationCount, fcSynced: false, modified: false };
+  const h = serializeWaypoints(wps);
+  const fcSynced = refs.get('fc') === h;
+  const modified = !fcSynced && refs.get('file') !== h && refs.get('db') !== h;
+  return { count, locationCount, fcSynced, modified };
+}
+
 function publishArduMissions(): void {
   const out = new Map<string, ArduWaypoint[]>();
-  for (const [id, slot] of arduSlots) out.set(id, slot.wps);
-  if (arduSlotOwner) out.set(arduSlotOwner, get(arduMission));
+  const status = new Map<string, ArduVehicleMissionStatus>();
+  for (const [id, slot] of arduSlots) { out.set(id, slot.wps); status.set(id, statusFor(slot.wps, slot.syncRefs)); }
+  if (arduSlotOwner) {
+    const live = get(arduMission);
+    out.set(arduSlotOwner, live);
+    status.set(arduSlotOwner, statusFor(live, arduSyncRefs));
+  }
   arduMissionsByVehicle.set(out);
+  arduMissionStatusByVehicle.set(status);
+}
+arduProvVersion.subscribe(() => publishArduMissions());
+
+/** Record a plan for `vehicleId` (a group upload landed it on that aircraft): the live planner when it
+ *  is the active vehicle, else its parked slot. `fcSynced` lights the FC badge for that vehicle. */
+export function arduSetVehicleMission(vehicleId: string, wps: ArduWaypoint[], fcSynced: boolean): void {
+  if (vehicleId === arduSlotOwner) {
+    arduUndoSuspend++;
+    arduMission.set(cloneWps(wps));
+    arduUndoSuspend--;
+    if (fcSynced) markArduMissionSynced('fc', wps);
+    return;
+  }
+  const prev = arduSlots.get(vehicleId);
+  const refs = new Map<ArduSyncFlag, string>(prev?.syncRefs ?? []);
+  if (fcSynced) refs.set('fc', serializeWaypoints(wps)); else refs.delete('fc');
+  arduSlots.set(vehicleId, { wps: cloneWps(wps), syncRefs: refs, loadedId: prev?.loadedId ?? null, undo: [], redo: [] });
+  publishArduMissions();
 }
 
 function stashArduSlot(id: string): void {
@@ -650,7 +741,14 @@ activeVehicleId.subscribe((id) => {
 });
 arduMission.subscribe(() => publishArduMissions());
 vehicles.subscribe((known) => {
-  if (known.size === 0) return; // disconnect-all keeps the slots for a reconnect in the same session
+  if (known.size === 0) {
+    // Disconnect-all keeps the slots for a reconnect in the same session, but what each aircraft holds
+    // is unknown from here on — drop every parked FC snapshot so no stale "FC" badge survives.
+    let cleared = false;
+    for (const slot of arduSlots.values()) if (slot.syncRefs.delete('fc')) cleared = true;
+    if (cleared) publishArduMissions();
+    return;
+  }
   let changed = false;
   for (const id of [...arduSlots.keys()]) if (!known.has(id) && id !== arduSlotOwner) { arduSlots.delete(id); changed = true; }
   if (changed) publishArduMissions();
