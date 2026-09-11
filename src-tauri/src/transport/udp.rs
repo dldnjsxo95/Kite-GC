@@ -139,6 +139,18 @@ impl ByteTransport for UdpTransport {
             {
                 Ok(0)
             }
+            // UDP is connectionless: on Windows a datagram we sent to a peer that has since closed its
+            // socket comes back as an ICMP "port unreachable", which the NEXT recv_from reports as
+            // ConnectionReset. With several learned peers (vehicles, another GCS) that happens whenever
+            // one of them goes away — it must not take the whole link down. The peer ages out on its own.
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::ConnectionRefused
+                    || e.kind() == std::io::ErrorKind::ConnectionAborted =>
+            {
+                log::debug!("UDP recv: {} — a peer went away, ignoring", e);
+                Ok(0)
+            }
             Err(e) => Err(TransportError::from(e)),
         }
     }

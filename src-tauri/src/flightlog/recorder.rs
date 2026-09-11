@@ -381,6 +381,10 @@ pub struct FlightRecorder {
     /// Whether the first polled status has been seen on this connection (the trustworthy point to
     /// evaluate the continue-on-reconnect decision — past any handshake residual flags).
     first_status_seen: bool,
+    /// Multi-vehicle: a recorder for a SECONDARY vehicle on a shared link runs unattended — its flights
+    /// commit on their own once the re-arm grace has passed (or on teardown) instead of parking in the
+    /// shared pending slot for the End-Flight dialog, which belongs to the primary vehicle.
+    auto_commit: bool,
 }
 
 /// Thread-safe handle to the flight recorder
@@ -426,7 +430,27 @@ impl FlightRecorder {
             pending,
             resume,
             first_status_seen: false,
+            auto_commit: false,
         })
+    }
+
+    /// Unattended mode (secondary vehicles): flights auto-commit after the re-arm grace / on teardown
+    /// and announce `flight-recording-autocommitted` instead of opening the End-Flight dialog.
+    pub fn set_auto_commit(&mut self, on: bool) {
+        self.auto_commit = on;
+    }
+
+    /// Commit a parked session now (auto-commit mode) and tell the frontend to refresh the logbook.
+    fn auto_commit_now(&self, p: PendingSession) {
+        match commit_pending_session(p) {
+            Ok(flight_id) => {
+                log::info!("Flight auto-committed (secondary vehicle): id {}", flight_id);
+                if let Err(e) = self.app_handle.emit("flight-recording-autocommitted", FlightRecordingEvent { flight_id }) {
+                    log::warn!("Failed to emit flight-recording-autocommitted: {}", e);
+                }
+            }
+            Err(e) => log::error!("Auto-commit failed: {}", e),
+        }
     }
 
     /// Update the protocol label (recorded in the flight metadata). Passive telemetry detects its
@@ -646,6 +670,12 @@ impl FlightRecorder {
             self.on_arm();
         } else if !is_armed && self.was_armed {
             self.on_disarm();
+        } else if !is_armed && self.auto_commit {
+            // Unattended: once the re-arm grace has lapsed, the parked flight is final — commit it.
+            let lapsed = self.pending.lock().ok().and_then(|mut s| {
+                if s.as_ref().is_some_and(|p| p.disarm_instant.elapsed() >= REARM_GRACE) { s.take() } else { None }
+            });
+            if let Some(p) = lapsed { self.auto_commit_now(p); }
         }
 
         self.was_armed = is_armed;
@@ -682,6 +712,11 @@ impl FlightRecorder {
                 return;
             }
             // Grace lapsed → auto-commit the previous flight, then start a fresh session.
+            if self.auto_commit {
+                self.auto_commit_now(p);
+                self.start_fresh_session();
+                return;
+            }
             match commit_pending_session(p) {
                 Ok(flight_id) => {
                     if let Err(e) = self
@@ -929,6 +964,12 @@ impl FlightRecorder {
         log::info!("DISARM detected — stopping flight recording");
         if let Some((session, _count)) = self.take_active_as_pending() {
             let dur = session.flight.duration_sec.unwrap_or(0);
+            if self.auto_commit {
+                // Unattended: park for the re-arm grace only; `on_status` commits it afterwards.
+                if let Ok(mut slot) = self.pending.lock() { *slot = Some(session); }
+                log::info!("Flight parked for auto-commit (disarm): {}s", dur);
+                return;
+            }
             self.stash_pending_and_emit_ended(session);
             log::info!("Flight pending commit (disarm): {}s", dur);
         }
@@ -1080,6 +1121,13 @@ impl FlightRecorder {
     /// flight may not be over (the user could be changing the COM port or switching to telemetry), so
     /// Continue-on-Reconnect must be offered (ADR-042), not the End-Flight dialog.
     pub fn shutdown(&mut self) {
+        if self.auto_commit {
+            let parked = self.pending.lock().ok().and_then(|mut s| s.take());
+            if let Some(p) = parked { self.auto_commit_now(p); }
+            if let Some((session, _)) = self.take_active_as_pending() { self.auto_commit_now(session); }
+            self.close_continuous_loggers();
+            return;
+        }
         if self.active_flight.is_some() {
             log::info!("Disconnect with active flight — stashed as pending (frontend confirmed, applies the action)");
             if let Some((session, _count)) = self.take_active_as_pending() {
@@ -1096,6 +1144,10 @@ impl FlightRecorder {
     /// but emits `flight-recording-interrupted` so the frontend shows the recovery prompt — there was
     /// no chance to pre-confirm the disconnect (ADR-042).
     pub fn shutdown_lost(&mut self) {
+        if self.auto_commit {
+            self.shutdown(); // unattended: nothing to ask the operator — commit what there is
+            return;
+        }
         if self.active_flight.is_some() {
             log::info!("Connection lost with active flight — offering recovery");
             if let Some((session, sample_count)) = self.take_active_as_pending() {

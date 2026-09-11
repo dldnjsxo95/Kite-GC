@@ -44,7 +44,7 @@
   import { homePosition, homeMarkerShown, vehicleHomes, type VehicleHome } from "$lib/stores/home";
   import { editMode, geoWaypoints, launchPoint, replayActive, toDeg } from "$lib/stores/mission";
   import { autopilotSystem } from "$lib/stores/autopilotContext";
-  import { arduMission, arduVehicleClass, arduEditMode, detectVehicleClass } from "$lib/stores/missionArdupilot";
+  import { arduMission, arduVehicleClass, arduEditMode, detectVehicleClass, arduMissionsByVehicle, type ArduWaypoint } from "$lib/stores/missionArdupilot";
   import { activeSurveyPattern } from "$lib/stores/surveyPattern.svelte";
   import { guidedActive, guidedTarget, guidedTargets, repositionTo, activeMode, guidedParams, fcLoiterRadius, type GuidedParams } from "$lib/controllers/vehicleControl";
   import GuidedTargetForm from "$lib/components/control/GuidedTargetForm.svelte";
@@ -534,6 +534,47 @@
   const fleetTrailHistory = new Map<string, L.Polyline[]>();
   const fleetHomeMarkers = new Map<string, L.Marker>();
   let fleetHomes: ReadonlyMap<string, VehicleHome> = new Map();
+  // Other vehicles' planned missions: a thin route line + small numbered dots in the vehicle colour,
+  // read-only (the active vehicle's mission is the editable MissionLayer).
+  const fleetMissionLayers = new Map<string, L.LayerGroup>();
+  const fleetMissionKeys = new Map<string, string>();
+  let fleetMissions: ReadonlyMap<string, ArduWaypoint[]> = new Map();
+  function updateFleetMission(v: VehicleSummary, color: string, layer: L.LayerGroup) {
+    const wps = fleetMissions.get(v.vehicleId) ?? [];
+    const pts: { n: number; ll: L.LatLng }[] = [];
+    let n = 0;
+    for (const wp of wps) {
+      if (!cmdHasLocation(wp.command)) continue;
+      n++;
+      if (wp.lat === 0 && wp.lon === 0) continue;
+      pts.push({ n, ll: L.latLng(wp.lat / 1e7, wp.lon / 1e7) });
+    }
+    const key = `${color}|${pts.map((p) => `${p.n}:${p.ll.lat.toFixed(6)},${p.ll.lng.toFixed(6)}`).join(';')}`;
+    if (fleetMissionKeys.get(v.vehicleId) === key) return;
+    fleetMissionKeys.set(v.vehicleId, key);
+    const old = fleetMissionLayers.get(v.vehicleId);
+    if (old) { layer.removeLayer(old); fleetMissionLayers.delete(v.vehicleId); }
+    if (pts.length === 0) return;
+    const g = L.layerGroup();
+    if (pts.length >= 2) L.polyline(pts.map((p) => p.ll), { color, weight: 2, opacity: 0.55, dashArray: '2 6', interactive: false }).addTo(g);
+    for (const p of pts) {
+      L.marker(p.ll, {
+        interactive: false,
+        zIndexOffset: 300,
+        icon: L.divIcon({
+          className: 'fleet-wp-divicon',
+          html: `<div class="fleet-wp" style="border-color:${color};color:${color}">${p.n}</div>`,
+          iconSize: [18, 18], iconAnchor: [9, 9],
+        }),
+      }).addTo(g);
+    }
+    g.addTo(layer);
+    fleetMissionLayers.set(v.vehicleId, g);
+  }
+  function removeFleetMission(id: string, layer: L.LayerGroup) {
+    const g = fleetMissionLayers.get(id);
+    if (g) { layer.removeLayer(g); fleetMissionLayers.delete(id); fleetMissionKeys.delete(id); }
+  }
 
   function pushFleetHistory(id: string, line: L.Polyline) {
     const h = fleetTrailHistory.get(id) ?? [];
@@ -597,6 +638,7 @@
     for (const [id, ft] of fleetTrails) if (gone(id)) { if (ft.line) layer.removeLayer(ft.line); fleetTrails.delete(id); }
     for (const [id, hs] of fleetTrailHistory) if (gone(id)) { for (const l of hs) layer.removeLayer(l); fleetTrailHistory.delete(id); }
     for (const [id, m] of fleetHomeMarkers) if (gone(id)) { layer.removeLayer(m); fleetHomeMarkers.delete(id); }
+    for (const id of [...fleetMissionLayers.keys()]) if (gone(id)) removeFleetMission(id, layer);
     for (const id of [...trailStash.keys()]) if (gone(id) && id !== trailOwner) dropStashedTrail(id);
   }
   /** A new session after a disconnect-all: the previous fleet's picture goes. */
@@ -608,6 +650,9 @@
     fleetTrailHistory.clear();
     for (const m of fleetHomeMarkers.values()) fleetLayer.removeLayer(m);
     fleetHomeMarkers.clear();
+    for (const g of fleetMissionLayers.values()) fleetLayer.removeLayer(g);
+    fleetMissionLayers.clear();
+    fleetMissionKeys.clear();
     for (const id of [...trailStash.keys()]) if (id !== trailOwner) dropStashedTrail(id);
   }
   function createFleetTargetIcon(color: string): L.DivIcon {
@@ -671,9 +716,11 @@
         if (modelStyle) drawFleetModel(marker, v.platformType, tv.yaw, tv.pitch, tv.roll, color);
         updateFleetTrail(v.vehicleId, tv, color, fleetLayer!);
         updateFleetHome(v, color, fleetLayer!);
+        updateFleetMission(v, color, fleetLayer!);
       } else {
         retireFleetTrail(v.vehicleId);
         removeFleetHome(v.vehicleId, fleetLayer!);
+        removeFleetMission(v.vehicleId, fleetLayer!);
       }
 
       // Guided target + heading line. Active vehicle: the Guided UI already draws the "G" target marker,
@@ -734,6 +781,7 @@
     }),
     activeVehicleId.subscribe((v) => { switchTrailOwner(v); fleetActive = v; if (map) updateFleet(); }),
     vehicleHomes.subscribe((v) => { fleetHomes = v; if (map) updateFleet(); }),
+    arduMissionsByVehicle.subscribe((v) => { fleetMissions = v; if (map) updateFleet(); }),
     guidedTargets.subscribe((v) => { fleetTargets = v; if (map) updateFleet(); }),
     guidedActive.subscribe(() => { if (map) updateFleet(); }),
   ];
@@ -2791,9 +2839,23 @@
   /* Fleet (other connected vehicles) markers — heading arrow + name; armed vehicles get a halo. */
   :global(.fleet-divicon),
   :global(.fleet-home-divicon),
+  :global(.fleet-wp-divicon),
   :global(.fleet-target-divicon) {
     background: none;
     border: none;
+  }
+  :global(.fleet-wp-divicon .fleet-wp) {
+    width: 18px;
+    height: 18px;
+    box-sizing: border-box;
+    border: 2px solid;
+    border-radius: 50%;
+    background: rgba(30, 30, 30, 0.75);
+    font: 700 9px 'Segoe UI', Tahoma, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.85;
   }
   :global(.fleet-divicon .fleet-icon) {
     position: relative;

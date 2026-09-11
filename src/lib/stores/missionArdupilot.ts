@@ -5,6 +5,7 @@ import { writable, derived, get } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
 import { connection } from './connection';
 import { settings } from './settings';
+import { activeVehicleId, vehicles } from './vehicles';
 import { CMD, cmdHasLocation, type VehicleClass } from '$lib/helpers/arduCommandCatalog';
 
 // ── MAV_CMD constants ─────────────────────────────────────────────────
@@ -424,7 +425,7 @@ export function arduClearUndoHistory(): void {
  *  mark it FC-synced (which gates "Set active WP"). Returns the waypoint count. Shared by the mission
  *  panel and the Vehicle Control panel; camera framing stays with the caller (a UI concern). */
 export async function downloadArduMissionFromFc(): Promise<number> {
-  const wps = await invoke<ArduWaypoint[]>('ardu_mission_download');
+  const wps = await invoke<ArduWaypoint[]>('ardu_mission_download', { vehicleId: get(activeVehicleId) });
   arduMission.set(wps);
   arduClearWpSelection();
   arduLoadedMissionId.set(null); // from the FC → not a library mission
@@ -578,3 +579,79 @@ export function parsePlanFile(text: string): ArduWaypoint[] {
   }
   return wps;
 }
+
+// ── Per-vehicle missions (multi-vehicle) ───────────────────────────────
+// The stores above stay the ACTIVE vehicle's planner (every panel / layer reads them unchanged). Each
+// vehicle's mission, provenance snapshots, library id and undo history are parked in a slot when the
+// active vehicle changes and brought back when it is selected again. A vehicle selected for the first
+// time starts from a COPY of the mission currently on screen (the usual fleet workflow: plan once,
+// upload to several aircraft, then diverge per vehicle) with fresh provenance — it has not been synced
+// with THAT aircraft yet. Disconnecting everything (no active vehicle) keeps the planner as it is, so
+// offline planning survives; the next vehicle to become active adopts it.
+interface ArduMissionSlot {
+  wps: ArduWaypoint[];
+  syncRefs: Map<ArduSyncFlag, string>;
+  loadedId: number | null;
+  undo: ArduWaypoint[][];
+  redo: ArduWaypoint[][];
+}
+const arduSlots = new Map<string, ArduMissionSlot>();
+let arduSlotOwner: string | null = null;
+
+/** Every vehicle's mission (the active one live, the others as parked), for the fleet map layers. */
+export const arduMissionsByVehicle = writable<ReadonlyMap<string, ArduWaypoint[]>>(new Map());
+function publishArduMissions(): void {
+  const out = new Map<string, ArduWaypoint[]>();
+  for (const [id, slot] of arduSlots) out.set(id, slot.wps);
+  if (arduSlotOwner) out.set(arduSlotOwner, get(arduMission));
+  arduMissionsByVehicle.set(out);
+}
+
+function stashArduSlot(id: string): void {
+  arduSlots.set(id, {
+    wps: get(arduMission),
+    syncRefs: new Map(arduSyncRefs),
+    loadedId: get(arduLoadedMissionId),
+    undo: arduUndoStack,
+    redo: arduRedoStack,
+  });
+}
+
+function restoreArduSlot(id: string): void {
+  const slot = arduSlots.get(id);
+  arduUndoSuspend++;
+  if (slot) {
+    arduMission.set(slot.wps);
+    arduSyncRefs.clear();
+    for (const [k, v] of slot.syncRefs) arduSyncRefs.set(k, v);
+    arduLoadedMissionId.set(slot.loadedId);
+    arduUndoStack = slot.undo;
+    arduRedoStack = slot.redo;
+  } else {
+    // First time on this vehicle: keep the plan on screen as its starting point, but nothing is synced yet.
+    arduMission.set(cloneWps(get(arduMission)));
+    arduSyncRefs.clear();
+    arduLoadedMissionId.set(null);
+    arduUndoStack = [];
+    arduRedoStack = [];
+  }
+  arduUndoSuspend--;
+  arduProvVersion.update((n) => n + 1);
+  arduSyncUndoFlags();
+  arduClearWpSelection();
+}
+
+activeVehicleId.subscribe((id) => {
+  if (id === arduSlotOwner) return;
+  if (arduSlotOwner) stashArduSlot(arduSlotOwner);
+  arduSlotOwner = id;
+  if (id) restoreArduSlot(id);
+  publishArduMissions();
+});
+arduMission.subscribe(() => publishArduMissions());
+vehicles.subscribe((known) => {
+  if (known.size === 0) return; // disconnect-all keeps the slots for a reconnect in the same session
+  let changed = false;
+  for (const id of [...arduSlots.keys()]) if (!known.has(id) && id !== arduSlotOwner) { arduSlots.delete(id); changed = true; }
+  if (changed) publishArduMissions();
+});

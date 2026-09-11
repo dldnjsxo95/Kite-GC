@@ -65,12 +65,15 @@ pub fn mav_arm(vehicle_id: Option<String>, arm: bool, force: bool, state: State<
 #[tauri::command(async)]
 pub fn mav_takeoff(vehicle_id: Option<String>, altitude: f32, state: State<'_, AppState>) -> Result<(), String> {
     let (cmd_tx, fc_sysid) = mav_handle(&state, vehicle_id.as_deref())?;
-    // param7 = altitude; lat/lon (param5/6) = 0 → take off in place.
+    // param7 = altitude. param4 (yaw) and param5/6 (lat/lon) are NaN = "current heading / here":
+    // PX4 reads a FINITE lat/lon as the take-off position, so 0/0 sent it climbing towards 0°N 0°E
+    // instead of straight up. ArduPilot ignores these fields for a take-off (param7 only), so NaN is
+    // harmless there. QGC sends the same.
     control::send_command_long(
         &cmd_tx,
         fc_sysid,
         MavCmd::MAV_CMD_NAV_TAKEOFF,
-        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, altitude],
+        [0.0, 0.0, 0.0, f32::NAN, f32::NAN, f32::NAN, altitude],
     )
 }
 
@@ -78,7 +81,8 @@ pub fn mav_takeoff(vehicle_id: Option<String>, altitude: f32, state: State<'_, A
 #[tauri::command(async)]
 pub fn mav_land(vehicle_id: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
     let (cmd_tx, fc_sysid) = mav_handle(&state, vehicle_id.as_deref())?;
-    control::send_command_long(&cmd_tx, fc_sysid, MavCmd::MAV_CMD_NAV_LAND, [0.0; 7])
+    // Same PX4 semantics as take-off: NaN yaw / lat / lon = land right here.
+    control::send_command_long(&cmd_tx, fc_sysid, MavCmd::MAV_CMD_NAV_LAND, [0.0, 0.0, 0.0, f32::NAN, f32::NAN, f32::NAN, 0.0])
 }
 
 /// Return to launch via `MAV_CMD_NAV_RETURN_TO_LAUNCH`.
@@ -234,8 +238,8 @@ pub fn mav_vtol_transition(vehicle_id: Option<String>, to_fw: bool, state: State
 /// Set a single FC parameter (e.g. the fixed-wing loiter radius `WP_LOITER_RAD`). Fire-and-forget.
 #[tauri::command(async)]
 pub fn mav_set_param(vehicle_id: Option<String>, name: String, value: f32, state: State<'_, AppState>) -> Result<(), String> {
-    let (cmd_tx, fc_sysid) = mav_handle(&state, vehicle_id.as_deref())?;
-    control::set_param(&cmd_tx, fc_sysid, &name, value)
+    let t = state.mav_target(vehicle_id.as_deref())?;
+    control::set_param(&t.cmd_tx, t.sysid, &name, value, t.fc_variant.eq_ignore_ascii_case("px4"))
 }
 
 /// Read a single FC parameter by name (best-effort; `None` when the FC doesn't report it within the

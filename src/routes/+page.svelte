@@ -89,7 +89,7 @@
   import { buildMissionInput } from '$lib/helpers/missionLibrary';
   import { buildArduMissionInput } from '$lib/helpers/missionLibraryArdu';
   import { homePosition, setVehicleHome } from '$lib/stores/home';
-  import { isActive, links } from '$lib/stores/vehicles';
+  import { isActive, links, activeVehicleId } from '$lib/stores/vehicles';
   import { ingestFcGuidedTarget, ingestVehicleGuidedTarget } from '$lib/controllers/vehicleControl';
   import { MAP_PROVIDERS } from "$lib/config/mapProviders";
   import { tileCacheStats, setCacheMaxMB, clearCache } from "$lib/cache/tileCache";
@@ -464,6 +464,38 @@
   let accMaxAlt = 0, accMaxSpeed = 0, accMaxDist = 0, accMah = 0, accTotalDist = 0;
   let accStartLat: number | null = null, accStartLon: number | null = null;
   let accLastLat: number | null = null, accLastLon: number | null = null;
+
+  // Multi-vehicle: the arm-edge detector and the flight-stats accumulator belong to ONE vehicle. When
+  // the active vehicle changes, park the current vehicle's state and bring back the new one's — a
+  // switch from a disarmed to an armed aircraft must not read as an arm edge (which would clear its
+  // track, reset its stats and move Home), nor a switch the other way as a disarm (End-Flight dialog).
+  interface FlightStatsSlot {
+    prevArmed: boolean; armEdgeInit: boolean; armStartMs: number;
+    accMaxAlt: number; accMaxSpeed: number; accMaxDist: number; accMah: number; accTotalDist: number;
+    accStartLat: number | null; accStartLon: number | null; accLastLat: number | null; accLastLon: number | null;
+  }
+  const flightStatsSlots = new globalThis.Map<string, FlightStatsSlot>(); // `Map` here is the map component
+  let flightStatsOwner: string | null = null;
+  activeVehicleId.subscribe((id) => {
+    if (id === flightStatsOwner) return;
+    if (flightStatsOwner) {
+      flightStatsSlots.set(flightStatsOwner, {
+        prevArmed, armEdgeInit, armStartMs, accMaxAlt, accMaxSpeed, accMaxDist, accMah, accTotalDist,
+        accStartLat, accStartLon, accLastLat, accLastLon,
+      });
+    }
+    flightStatsOwner = id;
+    const slot = id ? flightStatsSlots.get(id) : undefined;
+    if (slot) {
+      ({ prevArmed, armEdgeInit, armStartMs, accMaxAlt, accMaxSpeed, accMaxDist, accMah, accTotalDist,
+         accStartLat, accStartLon, accLastLat, accLastLon } = slot);
+    } else {
+      // Unknown vehicle: re-baseline on its first status-carrying frame (no edge), empty stats.
+      armEdgeInit = false; prevArmed = false; armStartMs = 0;
+      accMaxAlt = 0; accMaxSpeed = 0; accMaxDist = 0; accMah = 0; accTotalDist = 0;
+      accStartLat = null; accStartLon = null; accLastLat = null; accLastLon = null;
+    }
+  });
   telemetry.subscribe((t) => {
     liveTelem = t;
     // Accumulate the live flown track (RAM) for the Terrain Analyzer
@@ -3170,6 +3202,8 @@
     );
     // Grace-lapsed re-arm auto-committed the previous flight: close the (now stale) summary and link
     // the mission captured at that disarm.
+    // Secondary vehicles' flights commit by themselves (no End-Flight dialog) — just refresh the list.
+    void listen<{ flight_id: number }>('flight-recording-autocommitted', () => { void loadLogbook(); });
     void listen<{ flight_id: number }>('flight-recording-committed', async (event) => {
       const snap = endedMission; // snapshot before any await
       endFlightDialog?.close();
@@ -3191,6 +3225,13 @@
     );
     // The device vanished (fatal transport error) — the backend tore the scheduler down. Clean up the
     // connection state so the UI shows disconnected and the user can simply reconnect.
+    // MAVLink transport loss (serial unplugged, socket error): the backend handler thread has exited but
+    // the registry still lists the link — close it so the UI does not sit on a dead "connected" state.
+    void listen<{ linkId?: number }>('mavlink-disconnected', (event) => {
+      const lid = event.payload?.linkId;
+      if (lid != null && get(links).length > 1) { void disconnectLink(lid, selectedBaud).catch(() => {}); return; }
+      void disconnectFC(selectedBaud).catch(() => {});
+    });
     void listen<{ linkId?: number }>('connection-lost', (event) => {
       // Multi-vehicle: with other links still up, only close the one that died.
       const lid = event.payload?.linkId;

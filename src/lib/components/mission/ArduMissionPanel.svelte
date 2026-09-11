@@ -33,6 +33,7 @@
   import { frameMissionOnMap } from '$lib/stores/mapCamera';
   import { connection } from '$lib/stores/connection';
   import { settings } from '$lib/stores/settings';
+  import { activeVehicleId } from '$lib/stores/vehicles';
   import { autopilotSystem, type AutopilotSystem } from '$lib/stores/autopilotContext';
   import { missionManagerOpen } from '$lib/stores/missionManager';
   import { buildArduMissionInput, computeArduMissionStats } from '$lib/helpers/missionLibraryArdu';
@@ -305,7 +306,7 @@
         : $t('arduMission.uploading');
     });
     try {
-      await invoke<void>('ardu_mission_upload', { waypoints: wps });
+      await invoke<void>('ardu_mission_upload', { waypoints: wps, vehicleId: get(activeVehicleId) });
       markArduMissionSynced('fc', wps); // FC now holds exactly this mission
       statusMessage = $t('mission.uploaded', { values: { count: wps.length } });
     } catch (e) {

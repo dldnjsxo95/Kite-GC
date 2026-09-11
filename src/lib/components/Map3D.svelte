@@ -49,7 +49,7 @@
   import { switchVehicle } from "$lib/controllers/connectionController";
   import { guidedTargets, guidedActive, activeMode } from "$lib/controllers/vehicleControl";
   import { matchActiveMode } from "$lib/helpers/mavModes";
-  import { detectVehicleClass } from "$lib/stores/missionArdupilot";
+  import { detectVehicleClass, arduMissionsByVehicle } from "$lib/stores/missionArdupilot";
   import { vehicleColor } from "$lib/helpers/vehicleColors";
   import { connection, type ConnectionStatus } from "$lib/stores/connection";
   import { settings } from "$lib/stores/settings";
@@ -1792,6 +1792,8 @@
     home?: Cesium.Entity;
     target?: Cesium.Entity;
     line?: Cesium.Entity;
+    mission?: Cesium.Entity[];
+    missionKey?: string;
     color: string;
   }
   const fleet3d = new Map<string, Fleet3dRec>();
@@ -1801,6 +1803,7 @@
   let fleet3dActive: string | null = null;
   let fleet3dTargets: ReadonlyMap<string, { lat: number; lon: number; ts: number }> = new Map();
   let fleet3dHomes: ReadonlyMap<string, VehicleHome> = new Map();
+  let fleet3dMissions: ReadonlyMap<string, ArduWaypoint[]> = new Map();
   const FLEET3D_TARGET_STALE_MS = 10_000;
   const FLEET3D_TRAIL_MIN_M = 5;
   const FLEET3D_MODEL_TINT = 0.55;
@@ -1862,6 +1865,7 @@
         // The main UAV entity / live trail / home marker already show this vehicle.
         fleet3dRemove(rec, ['model', 'home']);
         if (rec.trail) { fleet3dRemove(rec, ['trail']); rec.trailPts = []; rec.trailLast = undefined; }
+        if (rec.mission) { for (const e of rec.mission) vw.entities.remove(e); rec.mission = undefined; rec.missionKey = undefined; }
       } else {
         // Model + name
         if (!rec.model) {
@@ -1910,6 +1914,40 @@
         } else {
           fleet3dRemove(rec, ['home']);
         }
+        // Planned mission (read-only): route line + numbered dots in the vehicle colour. Relative
+        // altitudes are stacked on the vehicle's home (or the ground when no home is known).
+        {
+          const wps = fleet3dMissions.get(v.vehicleId) ?? [];
+          const homeAlt = fleet3dHomes.get(v.vehicleId)?.alt ?? 0;
+          const pts: { n: number; pos: Cesium.Cartesian3 }[] = [];
+          let n = 0;
+          for (const wp of wps) {
+            if (!cmdHasLocation(wp.command)) continue;
+            n++;
+            if (wp.lat === 0 && wp.lon === 0) continue;
+            const relative = wp.frame === 3 || wp.frame === 10; // home-relative / terrain (MavFrame = 0 | 3 | 10)
+            const wpAlt = relative ? homeAlt + wp.alt : wp.alt;
+            pts.push({ n, pos: Cesium.Cartesian3.fromDegrees(wp.lon / 1e7, wp.lat / 1e7, Math.max(wpAlt + geoidOffset, 0)) });
+          }
+          const key = `${color}|${pts.map((p) => `${p.n}:${p.pos.x.toFixed(1)},${p.pos.y.toFixed(1)},${p.pos.z.toFixed(1)}`).join(';')}`;
+          if (rec.missionKey !== key) {
+            rec.missionKey = key;
+            for (const e of rec.mission ?? []) vw.entities.remove(e);
+            rec.mission = [];
+            if (pts.length >= 2) {
+              rec.mission.push(vw.entities.add({
+                polyline: { positions: pts.map((p) => p.pos), width: 2, material: new Cesium.PolylineDashMaterialProperty({ color: cesColor.withAlpha(0.7), dashLength: 12 }) },
+              }));
+            }
+            for (const p of pts) {
+              rec.mission.push(vw.entities.add({
+                position: p.pos,
+                point: { pixelSize: 9, color: Cesium.Color.fromCssColorString('#1e1e1e').withAlpha(0.8), outlineColor: cesColor, outlineWidth: 2, disableDepthTestDistance: Number.POSITIVE_INFINITY },
+                label: { ...fleet3dLabel(String(p.n), cesColor, -8), font: "bold 10px 'Segoe UI', sans-serif" },
+              }));
+            }
+          }
+        }
       }
 
       // Guided target + vehicle→target line (every vehicle; the active one in the Guided green)
@@ -1945,14 +1983,14 @@
     // Vehicles that are gone (or have no fix yet) lose their entities; a disconnect-all keeps the last picture.
     if (fleet3dKnown.size > 0) {
       for (const [id, rec] of fleet3d) {
-        if (!fleet3dKnown.has(id)) { fleet3dRemove(rec, ['model', 'trail', 'home', 'target', 'line']); fleet3d.delete(id); }
+        if (!fleet3dKnown.has(id)) { fleet3dRemove(rec, ['model', 'trail', 'home', 'target', 'line']); for (const e of rec.mission ?? []) vw.entities.remove(e); fleet3d.delete(id); }
       }
     }
     vw.scene.requestRender();
   }
   /** A new session after a disconnect-all: the previous fleet's picture goes. */
   function clearFleet3D() {
-    for (const rec of fleet3d.values()) fleet3dRemove(rec, ['model', 'trail', 'home', 'target', 'line']);
+    for (const rec of fleet3d.values()) { fleet3dRemove(rec, ['model', 'trail', 'home', 'target', 'line']); for (const e of rec.mission ?? []) viewer?.entities.remove(e); }
     fleet3d.clear();
   }
   const unsubFleet3d: (() => void)[] = [
@@ -1966,6 +2004,7 @@
     activeVehicleId.subscribe((v) => { fleet3dActive = v; if (viewer) updateFleet3D(); }),
     guidedTargets.subscribe((v) => { fleet3dTargets = v; if (viewer) updateFleet3D(); }),
     vehicleHomes.subscribe((v) => { fleet3dHomes = v; if (viewer) updateFleet3D(); }),
+    arduMissionsByVehicle.subscribe((v) => { fleet3dMissions = v; if (viewer) updateFleet3D(); }),
     guidedActive.subscribe(() => { if (viewer) updateFleet3D(); }),
   ];
 

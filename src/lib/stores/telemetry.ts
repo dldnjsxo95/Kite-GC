@@ -315,12 +315,24 @@ telemetry.subscribe((t) => {
 // from any vehicle other than the selected one so a shared link can't bleed into the widgets.
 
 let unlisteners: UnlistenFn[] = [];
+// Single-flight: connect, backend recovery and a page reload can all ask for the listeners at once.
+// Two overlapping registrations used to interleave with the stop() at the top of the next call and
+// leave the widgets without a live feed; now the second caller just awaits the first.
+let startingListeners: Promise<void> | null = null;
 
-export async function startTelemetryListeners() {
+export function startTelemetryListeners(): Promise<void> {
+  if (startingListeners) return startingListeners;
+  startingListeners = startTelemetryListenersInner().finally(() => { startingListeners = null; });
+  return startingListeners;
+}
+
+async function startTelemetryListenersInner() {
   // Clean up any existing listeners
   stopTelemetryListeners();
+  const fresh: UnlistenFn[] = [];
+  unlisteners = fresh;
 
-  unlisteners.push(
+  fresh.push(
     await listen<{ roll: number; pitch: number; yaw: number }>('telemetry-attitude', (event) => {
       upd(event.payload, (t) => ({
         ...t,
@@ -332,7 +344,7 @@ export async function startTelemetryListeners() {
     })
   );
 
-  unlisteners.push(
+  fresh.push(
     await listen<{
       fix_type: number; num_sat: number;
       lat: number; lon: number; alt_msl: number;
@@ -357,7 +369,7 @@ export async function startTelemetryListeners() {
     })
   );
 
-  unlisteners.push(
+  fresh.push(
     await listen<{ altitude: number; vario: number }>('telemetry-altitude', (event) => {
       upd(event.payload, (t) => ({
         ...t,
@@ -368,7 +380,7 @@ export async function startTelemetryListeners() {
     })
   );
 
-  unlisteners.push(
+  fresh.push(
     await listen<{
       voltage: number; mah_drawn: number; rssi: number; current: number;
       power: number; battery_percentage: number; cell_count: number;
@@ -391,7 +403,7 @@ export async function startTelemetryListeners() {
     )
   );
 
-  unlisteners.push(
+  fresh.push(
     await listen<{ throttle_pct: number; auto_throttle: boolean; uptime_s: number; flight_time_s: number }>(
       'telemetry-misc2',
       (event) => {
@@ -402,7 +414,7 @@ export async function startTelemetryListeners() {
     )
   );
 
-  unlisteners.push(
+  fresh.push(
     await listen<{ value: { id: number; voltage: number; current: number; mah_drawn: number; percentage: number; cell_count: number; temperature: number | null }[] }>(
       'telemetry-batteries',
       (event) => {
@@ -420,7 +432,7 @@ export async function startTelemetryListeners() {
     )
   );
 
-  unlisteners.push(
+  fresh.push(
     await listen<{ rssi_percent: number | null; rssi_dbm: number | null; lq: number | null; snr_db: number | null }>(
       'telemetry-linkstats',
       (event) => {
@@ -434,7 +446,7 @@ export async function startTelemetryListeners() {
     )
   );
 
-  unlisteners.push(
+  fresh.push(
     await listen<{ arming_flags: number; flight_mode_flags: number; cpu_load: number; sensor_status: number; msp_rc_override?: boolean }>('telemetry-status', (event) => {
       // flight_mode_flags is now forensic only — the canonical mode comes via telemetry-flightmode.
       upd(event.payload, (t) => ({
@@ -450,7 +462,7 @@ export async function startTelemetryListeners() {
     })
   );
 
-  unlisteners.push(
+  fresh.push(
     await listen<FlightModeState>('telemetry-flightmode', (event) => {
       upd(event.payload, (t) => ({
         ...t,
@@ -460,7 +472,7 @@ export async function startTelemetryListeners() {
     })
   );
 
-  unlisteners.push(
+  fresh.push(
     await listen<{
       gyro: number; acc: number; mag: number; baro: number;
       gps: number; rangefinder: number; pitot: number; opflow: number; prearm: number;
@@ -485,14 +497,14 @@ export async function startTelemetryListeners() {
   );
 
   // EKF estimator health (ArduPilot) — drives the header EKF indicator.
-  unlisteners.push(
+  fresh.push(
     await listen<{ status: number; max_variance: number; flags: number }>('telemetry-ekf-status', (event) => {
       upd(event.payload, (t) => ({ ...t, ekfStatus: event.payload.status, lastUpdate: Date.now() }));
     })
   );
 
   // EKF core version (AHRS_EKF_TYPE) — one-shot reply on connect, so no lastUpdate bump.
-  unlisteners.push(
+  fresh.push(
     await listen<{ ekf_type: number }>('telemetry-ekf-type', (event) => {
       upd(event.payload, (t) => ({ ...t, ekfType: event.payload.ekf_type }));
     })
@@ -500,14 +512,14 @@ export async function startTelemetryListeners() {
 
   // QuadPlane detection (ArduPilot Q_ENABLE reply) — a QuadPlane reports MAV_TYPE_FIXED_WING, so the
   // mission vehicle class can only be upgraded to quadplane from this one-shot param. Upgrade only.
-  unlisteners.push(
+  fresh.push(
     await listen<{ quadplane: boolean }>('telemetry-vehicle', (event) => {
       if (!isActive(event.payload)) return;
       if (event.payload.quadplane) arduVehicleClass.set('quadplane');
     })
   );
 
-  unlisteners.push(
+  fresh.push(
     await listen<{ active_wp_number: number; nav_state: number }>('telemetry-nav-status', (event) => {
       upd(event.payload, (t) => ({
         ...t,
@@ -518,7 +530,7 @@ export async function startTelemetryListeners() {
     })
   );
 
-  unlisteners.push(
+  fresh.push(
     await listen<{ airspeed: number }>('telemetry-airspeed', (event) => {
       upd(event.payload, (t) => ({
         ...t,
@@ -528,7 +540,7 @@ export async function startTelemetryListeners() {
     })
   );
 
-  unlisteners.push(
+  fresh.push(
     await listen<{ direction_from_deg: number; speed_ms: number }>('telemetry-wind', (event) => {
       upd(event.payload, (t) => ({
         ...t,
@@ -540,7 +552,7 @@ export async function startTelemetryListeners() {
   );
 
   // Altitude reference: does this protocol deliver true MSL, or only arming-relative altitude?
-  unlisteners.push(
+  fresh.push(
     await listen<{ msl: boolean }>('telemetry-alt-ref', (event) => {
       if (!isActive(event.payload)) return;
       altReference.set({ msl: event.payload.msl });
@@ -550,7 +562,7 @@ export async function startTelemetryListeners() {
   );
 
   // Passive-telemetry locked protocol (+ optional secondary) for the connection status box.
-  unlisteners.push(
+  fresh.push(
     await listen<{ primary: string; secondary: string | null }>('telemetry-protocol', (event) => {
       if (!isActive(event.payload)) return;
       connectionProtocol.set({ primary: event.payload.primary, secondary: event.payload.secondary });
@@ -558,14 +570,14 @@ export async function startTelemetryListeners() {
   );
 
   // FC-link liveness (passive): fresh FC-origin frames, independent of the cached-state re-emit + RX noise.
-  unlisteners.push(
+  fresh.push(
     await listen<{ alive: boolean }>('telemetry-fc-link', (event) => {
       if (!isActive(event.payload)) return;
       fcLinkAlive.set(event.payload.alive);
     })
   );
 
-  unlisteners.push(
+  fresh.push(
     await listen<{ hdop: number }>('telemetry-gps-stats', (event) => {
       upd(event.payload, (t) => ({
         ...t,
