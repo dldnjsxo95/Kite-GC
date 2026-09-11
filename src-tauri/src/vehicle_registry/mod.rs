@@ -191,7 +191,6 @@ impl LinkRegistry {
         self.links.len()
     }
 
-    #[allow(dead_code)] // Phase B (link list UI)
     pub fn get(&self, id: LinkId) -> Option<&LinkEntry> {
         self.links.get(&id)
     }
@@ -297,4 +296,22 @@ mod tests {
         assert_eq!(reg.reserve_id(), u16::MAX);
         assert_eq!(reg.reserve_id(), 1, "wraps past 0 (0 is never a valid link id)");
     }
+}
+
+/// Whether a stamped event payload (JSON text, see `emitter`) belongs to the active vehicle. Payloads
+/// without a `vehicleId` (events that are not per-vehicle) pass. Used by the backend taps (relay hub,
+/// Telemetry API) so their single caches follow the vehicle the operator selected instead of mixing
+/// every aircraft on the link. Cheap: a substring scan, no JSON parse.
+pub fn payload_is_active(app: &tauri::AppHandle, payload: &str) -> bool {
+    use tauri::Manager;
+    let Some(start) = payload.find("\"vehicleId\":\"") else { return true };
+    let rest = &payload[start + 13..];
+    let Some(end) = rest.find('"') else { return true };
+    let vid = &rest[..end];
+    let st = app.state::<crate::state::AppState>();
+    let is_active = match st.links.lock() {
+        Ok(reg) => reg.active().map(|a| a.to_key() == vid).unwrap_or(true),
+        Err(_) => true,
+    };
+    is_active
 }

@@ -343,16 +343,19 @@ export async function recoverBackendLinks(): Promise<boolean> {
   await startVehicleListeners();
   const l = await refreshLinks().catch(() => [] as Awaited<ReturnType<typeof refreshLinks>>);
   if (l.length === 0) return false;
+  // The vehicle list is built from live `vehicle-discovered` events; after a reload ask for a replay.
+  await invoke('announce_vehicles').catch(() => {});
   let active = get(activeVehicleId);
   if (!active) {
     active = await invoke<string | null>('get_active_vehicle').catch(() => null);
     if (active) activeVehicleId.set(active);
   }
-  if (get(connection).status !== 'connected') {
-    await startTelemetryListeners();
-    await applyRelaysOnConnect();
-  }
+  // Always (re)arm the live feed: this runs after a page reload or a UI state that drifted, where the
+  // module-level listeners may be gone even though the store still says "connected".
+  await startTelemetryListeners();
+  if (get(connection).status !== 'connected') await applyRelaysOnConnect();
   if (active) await applyActiveVehicle(active);
+  void invoke('log_frontend', { level: 'info', area: 'ui', message: `recoverBackendLinks: ${l.length} link(s), active ${active ?? 'none'} — telemetry listeners armed` }).catch(() => {});
   return true;
 }
 

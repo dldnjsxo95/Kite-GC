@@ -120,6 +120,30 @@ impl AppState {
         }
     }
 
+    /// Point the MAVLink RC-injection stream at `vehicle` (the new active vehicle) and DISENGAGE it.
+    /// Re-pointing a live stream would hand the sticks to a different aircraft without the operator
+    /// noticing; they re-engage on the new vehicle explicitly (the frontend mirrors this). The PX4 /
+    /// ArduPilot choice follows the link's handshake variant (vehicles sharing one link share it).
+    pub fn retarget_rc(&self, vehicle: Option<&crate::vehicle_registry::VehicleId>) {
+        let target = vehicle.and_then(|v| {
+            let reg = self.links.lock().ok()?;
+            let entry = reg.get(v.link)?;
+            Some(crate::scheduler::rc_tx::RcTarget {
+                link: v.link,
+                sysid: v.sysid,
+                px4: entry.fc_info.fc_variant.eq_ignore_ascii_case("px4"),
+            })
+        });
+        if let Ok(mut rc) = self.rc_tx.lock() {
+            if rc.mav_target != target || target.is_none() {
+                rc.enabled = false;
+                rc.mav_override_us.clear();
+                rc.mav_manual = None;
+            }
+            rc.mav_target = target;
+        }
+    }
+
     /// The active link's handshake info, if connected.
     #[allow(dead_code)] // Phase C (link status / relay per-vehicle)
     pub fn active_fc_info(&self) -> Option<FcInfo> {

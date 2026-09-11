@@ -9,7 +9,8 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::commands::connection::ActiveVehicleChanged;
 use crate::state::AppState;
-use crate::vehicle_registry::{LinkSummary, VehicleId};
+use crate::state::ActiveProtocol;
+use crate::vehicle_registry::{LinkSummary, VehicleId, VehicleInfo};
 
 /// Every open link with its protocol, transport and handshake info.
 #[tauri::command]
@@ -38,7 +39,23 @@ pub fn set_active_vehicle(vehicle_id: String, state: State<'_, AppState>, app_ha
         }
         reg.set_active(vid.clone())?;
     }
+    state.retarget_rc(Some(&vid)); // RC stream follows the active vehicle — disengaged, re-engage explicitly
     log::info!("Active vehicle → {}", vid);
     let _ = app_handle.emit("active-vehicle-changed", ActiveVehicleChanged { vehicle_id: Some(vid.to_key()) });
+    Ok(())
+}
+
+/// Re-announce every known vehicle (`vehicle-discovered`), so a frontend that (re)loaded after the
+/// live announcements can rebuild its vehicle list. MAVLink links answer from their handler thread
+/// (they know the vehicles discovered on a shared link); MSP / passive links have exactly one vehicle.
+#[tauri::command]
+pub fn announce_vehicles(state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
+    let reg = state.links.lock().map_err(|e| e.to_string())?;
+    for entry in reg.iter() {
+        match &entry.protocol {
+            ActiveProtocol::Mavlink(h) => h.announce_vehicles(),
+            _ => { let _ = app_handle.emit("vehicle-discovered", VehicleInfo::primary_of(entry, 0)); }
+        }
+    }
     Ok(())
 }

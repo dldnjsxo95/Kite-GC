@@ -377,6 +377,7 @@ pub async fn connect(
     crate::link_presence::link_up(&opened.fc_info, opened.protocol_name);
     let _ = app_handle.emit("vehicle-discovered", &discovered);
     if activated {
+        state.retarget_rc(Some(&primary));
         let _ = app_handle.emit("active-vehicle-changed", ActiveVehicleChanged { vehicle_id: Some(primary.to_key()) });
     }
 
@@ -743,7 +744,7 @@ fn connect_mavlink(
 
         // MAVLink records via .tlog; the MSP raw sink is unused here (kept empty).
         let msp_raw_sink: MspRawSink = std::sync::Arc::new(std::sync::Mutex::new(None));
-        match FlightRecorder::new(flight_log_settings, fc_info.clone(), "MAVLink", portable, app_handle.clone(), state.pending_session.clone(), state.resume_pending.clone(), state.active_temp_path.clone(), msp_raw_sink) {
+        match FlightRecorder::new(flight_log_settings.clone(), fc_info.clone(), "MAVLink", portable, app_handle.clone(), state.pending_session.clone(), state.resume_pending.clone(), state.active_temp_path.clone(), msp_raw_sink) {
             Ok(mut rec) => {
                 rec.start_continuous_log();
                 let handle = std::sync::Arc::new(std::sync::Mutex::new(rec));
@@ -770,8 +771,18 @@ fn connect_mavlink(
         wind_enabled: wind_enabled.unwrap_or(false),
     };
     store_recorder(&state, &recorder_handle);
+    // Vehicles discovered later on this link record unattended (DB only) with the same settings.
+    let secondary_recording = if flight_log_settings.enabled && flight_log_settings.db_enabled {
+        let portable = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.join(".portable").exists()))
+            .unwrap_or(false);
+        Some(mavlink_proto::handler::SecondaryRecording { settings: flight_log_settings.clone(), portable })
+    } else {
+        None
+    };
     let emitter = VehicleEmitter::new(app_handle, VehicleId::new(link_id, fc_sysid));
-    let handle = mavlink_proto::handler::start(byte_transport, fc_sysid, fc_compid, fc_info.fc_variant.clone(), emitter, recorder_handle, state.rc_tx.clone(), rates);
+    let handle = mavlink_proto::handler::start(byte_transport, fc_sysid, fc_compid, fc_info.fc_variant.clone(), (fc_info.platform_type, fc_info.mav_type), emitter, recorder_handle, state.rc_tx.clone(), rates, secondary_recording);
 
     Ok(Opened { protocol: ActiveProtocol::Mavlink(handle), protocol_name: "MAVLink", fc_info, sysid: fc_sysid, compid: fc_compid })
 }
@@ -883,6 +894,7 @@ pub async fn disconnect(link_id: Option<LinkId>, state: State<'_, AppState>, app
     }
 
     if let Some(new_active) = active_change {
+        state.retarget_rc(new_active.as_ref());
         let _ = app_handle.emit("active-vehicle-changed", ActiveVehicleChanged { vehicle_id: new_active.map(|v| v.to_key()) });
     }
 

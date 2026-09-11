@@ -100,7 +100,13 @@ impl TelemetryApi {
             };
             (@store $event:literal, $ty:ty, $field:ident, $stamp:expr, $unwrap:expr) => {{
                 let state = self.state.clone();
-                app.listen($event, move |ev| match serde_json::from_str::<$ty>(ev.payload()) {
+                let app_for_filter = app.clone();
+                app.listen($event, move |ev| {
+                    // Multi-vehicle: the API serves the ACTIVE vehicle (design §5; per-vehicle frames later).
+                    if !crate::vehicle_registry::payload_is_active(&app_for_filter, ev.payload()) {
+                        return;
+                    }
+                    match serde_json::from_str::<$ty>(ev.payload()) {
                     Ok(d) => {
                         let mut st = state.lock().unwrap();
                         st.$field = Some(($unwrap)(d));
@@ -109,6 +115,7 @@ impl TelemetryApi {
                         }
                     }
                     Err(e) => log::debug!("[telemetry-api] {} payload not understood: {e}", $event),
+                    }
                 });
             }};
         }

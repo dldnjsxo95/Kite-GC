@@ -40,7 +40,7 @@ mod vehicle_registry;
 mod video;
 
 use commands::connection::{connect, disconnect, set_platform_type, inav_set_craft_name, inav_read_stats, scan_ble_devices, ble_scan_start, ble_scan_stop};
-use commands::vehicles::{list_links, set_active_vehicle, get_active_vehicle};
+use commands::vehicles::{list_links, set_active_vehicle, get_active_vehicle, announce_vehicles};
 use commands::connection::list_serial_ports;
 use commands::flightlog::{
     flightlog_list, flightlog_get, flightlog_get_track, flightlog_get_battery_records, flightlog_delete,
@@ -628,6 +628,7 @@ pub fn run() {
             list_links,
             set_active_vehicle,
             get_active_vehicle,
+            announce_vehicles,
             get_app_version,
             is_debug_mode,
             link_status::telemetry_track_since,
