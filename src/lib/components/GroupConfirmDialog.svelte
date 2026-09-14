@@ -51,7 +51,17 @@
   let offsetM = $state(0);
   let offsetBearing = $state(90);
   let plan = $state<ArduWaypoint[]>([]);
+  let plans = $state<Record<string, ArduWaypoint[]>>({});
+  // The request's params as handed in — the result is built ON TOP of them, so fields the dialog has
+  // no control for (goSeqs, …) pass through untouched.
+  let reqParams: GroupCommandParams = {};
   let resolver: ((value: GroupConfirmResult | null) => void) | null = null;
+
+  const isUpload = $derived(kind === 'missionUpload' || kind === 'formationUpload');
+  function planFor(id: string): ArduWaypoint[] | undefined {
+    if (!isUpload) return undefined;
+    return kind === 'formationUpload' ? (plans[id] ?? []) : plan;
+  }
 
   // Verdicts depend on the intent (setMode), so they are derived, not captured at open time.
   const checks = $derived.by(() => {
@@ -59,18 +69,21 @@
     const now = Date.now();
     const out = new Map<string, PreflightResult>();
     for (const tg of targets) {
-      out.set(tg.vehicle.vehicleId, preflightChecks(kind, tg.vehicle, telem.get(tg.vehicle.vehicleId), kind === 'setMode' ? intent : undefined, now, kind === 'missionUpload' ? plan : undefined));
+      const id = tg.vehicle.vehicleId;
+      out.set(id, preflightChecks(kind, tg.vehicle, telem.get(id), kind === 'setMode' ? intent : undefined, now, planFor(id)));
     }
     return out;
   });
   const includedCount = $derived(targets.filter((tg) => included.has(tg.vehicle.vehicleId)).length);
 
-  const hasParams = $derived(kind === 'takeoff' || kind === 'changeSpeed' || kind === 'setMode' || kind === 'arm' || kind === 'disarm' || kind === 'missionUpload');
+  const staggerKinds: GroupCommandKind[] = ['takeoff', 'rtl', 'land'];
+  const hasParams = $derived(staggerKinds.includes(kind) || kind === 'changeSpeed' || kind === 'setMode' || kind === 'arm' || kind === 'disarm' || kind === 'missionUpload' || kind === 'formationUpload' || kind === 'formationGo');
 
   /** Open for `req`; resolves with the included ids + final params, or null on cancel. */
   export function show(req: GroupConfirmRequest): Promise<GroupConfirmResult | null> {
     kind = req.kind;
     targets = req.targets;
+    reqParams = { ...req.params };
     altitude = req.params.altitude ?? altitude;
     staggerS = Math.round(((req.params.staggerMs ?? staggerS * 1000) / 1000) * 10) / 10;
     speed = req.params.speed ?? speed;
@@ -79,13 +92,15 @@
     offsetM = req.params.offsetM ?? offsetM;
     offsetBearing = req.params.offsetBearingDeg ?? offsetBearing;
     plan = req.params.waypoints ?? [];
+    plans = req.params.plans ?? {};
     // Default inclusion: everything that isn't a hard `fail`.
     const telem = get(allTelemetry);
     const now = Date.now();
     const inc = new Set<string>();
     for (const tg of targets) {
-      const c = preflightChecks(kind, tg.vehicle, telem.get(tg.vehicle.vehicleId), kind === 'setMode' ? intent : undefined, now, kind === 'missionUpload' ? plan : undefined);
-      if (c.level !== 'fail') inc.add(tg.vehicle.vehicleId);
+      const id = tg.vehicle.vehicleId;
+      const c = preflightChecks(kind, tg.vehicle, telem.get(id), kind === 'setMode' ? intent : undefined, now, planFor(id));
+      if (c.level !== 'fail') inc.add(id);
     }
     included = inc;
     open = true;
@@ -99,12 +114,14 @@
 
   function confirm() {
     if (includedCount === 0) return;
-    const params: GroupCommandParams = {};
-    if (kind === 'takeoff') { params.altitude = altitude; params.staggerMs = Math.round(staggerS * 1000); }
+    const params: GroupCommandParams = { ...reqParams };
+    if (kind === 'takeoff') params.altitude = altitude;
+    if (staggerKinds.includes(kind)) params.staggerMs = Math.round(staggerS * 1000);
     if (kind === 'changeSpeed') params.speed = speed;
     if (kind === 'setMode') params.intent = intent;
     if (kind === 'arm' || kind === 'disarm') params.force = force;
     if (kind === 'missionUpload') { params.waypoints = plan; params.offsetM = offsetM; params.offsetBearingDeg = offsetBearing; }
+    if (kind === 'formationUpload') params.plans = plans;
     close({ vehicleIds: targets.filter((tg) => included.has(tg.vehicle.vehicleId)).map((tg) => tg.vehicle.vehicleId), params });
   }
 
@@ -154,6 +171,15 @@
               <span>{$t('fleet.group.stagger')}</span>
               <NumberStepper bind:value={staggerS} min={0} max={10} step={0.5} decimals={1} unit="s" />
             </label>
+          {:else if kind === 'rtl' || kind === 'land'}
+            <label class="gc-param" title={$t('fleet.kindHint.rtlStagger')}>
+              <span>{$t('fleet.group.stagger')}</span>
+              <NumberStepper bind:value={staggerS} min={0} max={30} step={0.5} decimals={1} unit="s" />
+            </label>
+          {:else if kind === 'formationUpload'}
+            <div class="gc-note">{$t('formation.uploadTip')}</div>
+          {:else if kind === 'formationGo'}
+            <div class="gc-note">{$t('formation.goTip')}</div>
           {:else if kind === 'changeSpeed'}
             <label class="gc-param">
               <span>{$t('fleet.group.speed')}</span>

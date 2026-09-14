@@ -30,8 +30,10 @@
 
   let dialog = $state<GroupConfirmDialog>();
 
-  // Remembered between dialogs (module-scope, like MavCommandPanel's savedInputs).
+  // Remembered between dialogs (module-scope, like MavCommandPanel's savedInputs). Takeoff and RTL/Land
+  // keep separate stagger values: a 1 s takeoff gap is routine, an RTL gap is opt-in.
   const remembered: GroupCommandParams = { altitude: 50, staggerMs: 1000, speed: 10, intent: 'hold' };
+  let rememberedArrivalStaggerMs = 0;
 
   const mavVehicles = $derived(orderedVehicles($vehicles).filter((v) => isMavlinkVehicle(v) && vehicleSystem(v) != null));
   const selectedMav = $derived(mavVehicles.filter((v) => $selectedVehicleIds.has(v.vehicleId)));
@@ -61,12 +63,16 @@
     // Upload sends whatever the mission editor holds right now (the active vehicle's plan).
     const params: GroupCommandParams = kind === 'missionUpload'
       ? { ...remembered, waypoints: get(arduMission) }
-      : { ...remembered };
+      : kind === 'rtl' || kind === 'land'
+        ? { ...remembered, staggerMs: rememberedArrivalStaggerMs }
+        : { ...remembered };
     const res = await dialog.show({ kind, targets, params });
     if (!res) return;
-    const { waypoints: _wps, ...keep } = res.params;
-    void _wps;
+    const { waypoints: _wps, plans: _plans, staggerMs, ...keep } = res.params;
+    void _wps; void _plans;
     Object.assign(remembered, keep);
+    if (kind === 'rtl' || kind === 'land') rememberedArrivalStaggerMs = staggerMs ?? 0;
+    else if (staggerMs != null) remembered.staggerMs = staggerMs;
     await runGroupCommand(kind, targetsFor(res.vehicleIds), res.params);
   }
 
@@ -84,15 +90,21 @@
     { kind: 'rtl', variant: 'warning' },
     { kind: 'hold', variant: 'standard' },
     { kind: 'missionStart', variant: 'standard' },
+    { kind: 'missionRestart', variant: 'standard' },
     { kind: 'changeSpeed', variant: 'data' },
     { kind: 'setMode', variant: 'data' },
   ];
+  function kindTitle(kind: GroupCommandKind): string {
+    if (selCount < 2) return $t('fleet.group.hint');
+    if (kind === 'missionStart' || kind === 'missionRestart') return $t('fleet.kindHint.' + kind);
+    return '';
+  }
 </script>
 
 <div class="gcbtns" class:wrap>
   <div class="gcbtns-row">
     {#each kinds as k (k.kind)}
-      <Button size="sm" variant={k.variant} disabled={!canGroup} onclick={() => open(k.kind)} title={selCount < 2 ? $t('fleet.group.hint') : ''}>
+      <Button size="sm" variant={k.variant} disabled={!canGroup} onclick={() => open(k.kind)} title={kindTitle(k.kind)}>
         {$t('fleet.kind.' + k.kind)}
       </Button>
     {/each}

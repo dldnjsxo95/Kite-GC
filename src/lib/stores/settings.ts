@@ -37,6 +37,24 @@ export type GcsMode = 'off' | 'manual' | 'continuous';
  *  model as the active vehicle (tinted in the vehicle's colour) or a flat heading arrow. */
 export type FleetMarkerStyle = 'model' | 'symbol';
 
+/** Formation shapes — slot geometry lives in helpers/formationMission.ts. */
+export type FormationShape = 'line' | 'trail' | 'vee' | 'wedge' | 'grid' | 'circle';
+export interface FormationSettings {
+  shape: FormationShape;
+  /** Horizontal spacing between neighbouring slots (m). */
+  spacingM: number;
+  /** Altitude added per slot index (m) — a climbing stack keeps crossing paths apart. 0 = same level. */
+  altStepM: number;
+  /** Slots rotate with the path heading (true) or stay north-up (false). */
+  headingRelative: boolean;
+  /** Fleet separation alarm threshold (m). */
+  minSeparationM: number;
+  /** GCS follower: corner rounding radius for the reference route (m, 0 = sharp). */
+  turnRadiusM: number;
+  /** GCS follower: max rotation rate of the formation frame (deg/s) — also caps the leader's speed in turns. */
+  maxYawRateDegS: number;
+}
+
 export interface InterfaceSettings {
   speedUnit: SpeedUnit;
   altitudeUnit: AltitudeUnit;
@@ -404,6 +422,8 @@ export interface AppSettings {
   /** GCS marker mode: off / manual (drag) / continuous (live OS location). */
   gcsMode: GcsMode;
   fleetMarkerStyle: FleetMarkerStyle;
+  /** Formation flight: shape, spacing, per-slot altitude step, heading-relative slots, separation alarm. */
+  formation: FormationSettings;
   /** Last known physical user location (for Night-Mode auto sunset timing); persisted across sessions. */
   userLocation: { lat: number; lon: number } | null;
   /** Radar (foreign-vehicle tracking) subsystem settings. */
@@ -489,6 +509,7 @@ const defaults: AppSettings = {
   nightMode2D: 'auto',
   gcsMode: 'continuous',
   fleetMarkerStyle: 'model',
+  formation: { shape: 'line', spacingM: 20, altStepM: 0, headingRelative: true, minSeparationM: 8, turnRadiusM: 40, maxYawRateDegS: 12 },
   userLocation: null,
   radar: DEFAULT_RADAR,
   airspace: DEFAULT_AIRSPACE,

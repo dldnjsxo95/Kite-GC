@@ -25,6 +25,7 @@
   import { arduMissionStatusByVehicle, type ArduVehicleMissionStatus } from '$lib/stores/missionArdupilot';
   import { activeWpNumber } from '$lib/stores/navStatus';
   import { requestNavTab } from '$lib/stores/navRequest';
+  import { separationAlerts } from '$lib/stores/fleetSeparation';
   import { isArmed } from '$lib/helpers/telemetry';
   import { modeLabel, modeColor } from '$lib/helpers/flightModeRegistry';
   import {
@@ -174,6 +175,14 @@
         <span>{$t('fleet.empty')}</span>
       </div>
     {:else}
+      {#if $separationAlerts.length}
+        <div class="fp-sep-alert" role="alert">
+          <strong>{$t('fleet.separation.title')}</strong>
+          {#each $separationAlerts as a (a.a + a.b)}
+            <div>{$t('fleet.separation.pair', { values: { a: a.aName, b: a.bName, d: a.distanceM.toFixed(0), p: a.projectedM.toFixed(0) } })}</div>
+          {/each}
+        </div>
+      {/if}
       <div class="fp-hint">{$t('fleet.switchHint')}</div>
       <ul class="fp-list">
         {#each rows as r (r.v.vehicleId)}
@@ -313,6 +322,16 @@
     margin: 0 0 6px;
     font-size: 11px;
     color: #888;
+  }
+  .fp-sep-alert {
+    margin: 0 0 8px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background: rgba(224, 108, 108, 0.18);
+    border: 1px solid rgba(224, 108, 108, 0.6);
+    color: #f0a0a0;
+    font-size: 11.5px;
+    line-height: 1.4;
   }
 
   .fp-list, .fp-results {

@@ -19,6 +19,7 @@
   import { telemetry, allTelemetry, type TelemetryData } from "$lib/stores/telemetry";
   import { vehicles, activeVehicleId, type VehicleSummary } from "$lib/stores/vehicles";
   import { selectedVehicleIds, toggleSelected, setSelected } from "$lib/stores/fleetSelection";
+  import { formationPreview, formationPathPreview, type FormationPreviewSlot } from "$lib/stores/formation";
   import { switchVehicle } from "$lib/controllers/connectionController";
   import { matchActiveMode } from "$lib/helpers/mavModes";
   import { vehicleColor } from "$lib/helpers/vehicleColors";
@@ -481,6 +482,43 @@
   // the fleet camera mode frames the selection (2+) instead of the whole fleet.
   let fleetSelected: ReadonlySet<string> = new Set();
   let fleetCount = $state(0); // reactive mirror of the registry size (drives the fleet camera button)
+
+  // ── Formation slot preview (stores/formation) ──────────────────────────────────────────────
+  // Ghost markers where each slot of the planned formation sits; the assigned vehicle's colour + name.
+  let formationSlotsPreview: FormationPreviewSlot[] | null = null;
+  let formationPathPts: { lat: number; lon: number }[] | null = null;
+  let formationLayer: L.LayerGroup | undefined;
+  function updateFormationPreview() {
+    if (!map) return;
+    if (!formationLayer) formationLayer = L.layerGroup().addTo(map);
+    formationLayer.clearLayers();
+    // The follower's corner-rounded reference track (one line the whole formation follows).
+    if (formationPathPts && formationPathPts.length >= 2) {
+      L.polyline(formationPathPts.map((p) => [p.lat, p.lon] as L.LatLngExpression), {
+        color: '#37a8db', weight: 3, opacity: 0.85, interactive: false,
+      }).addTo(formationLayer);
+    }
+    const slots = formationSlotsPreview;
+    if (!slots || slots.length === 0) return;
+    if (slots.length >= 2) {
+      L.polygon(slots.map((s) => [s.lat, s.lon] as L.LatLngExpression), {
+        color: '#37a8db', weight: 1, opacity: 0.5, fill: false, dashArray: '3 5', interactive: false,
+      }).addTo(formationLayer);
+    }
+    for (const s of slots) {
+      const color = s.color ?? '#37a8db';
+      const label = s.name ? escapeHtml(s.name) : '';
+      L.marker([s.lat, s.lon], {
+        interactive: false,
+        zIndexOffset: 350,
+        icon: L.divIcon({
+          className: 'formation-slot-divicon',
+          html: `<div class="formation-slot" style="--vc:${color}"><span class="formation-slot-n">${s.index + 1}</span>${label ? `<span class="formation-slot-name">${label}</span>` : ''}${s.up ? `<span class="formation-slot-up">+${Math.round(s.up)} m</span>` : ''}</div>`,
+          iconSize: [26, 26], iconAnchor: [13, 13],
+        }),
+      }).addTo(formationLayer);
+    }
+  }
   let fleetTargets: ReadonlyMap<string, { lat: number; lon: number; ts: number }> = new Map();
   const FLEET_TARGET_STALE_MS = 10_000;
   const FLEET_BASE_PX = 26;
@@ -805,6 +843,8 @@
     }),
     activeVehicleId.subscribe((v) => { switchTrailOwner(v); fleetActive = v; if (map) updateFleet(); }),
     selectedVehicleIds.subscribe((s) => { fleetSelected = s; if (map) updateFleet(); }),
+    formationPreview.subscribe((p) => { formationSlotsPreview = p; if (map) updateFormationPreview(); }),
+    formationPathPreview.subscribe((p) => { formationPathPts = p; if (map) updateFormationPreview(); }),
     frameFleetSignal.subscribe((n) => {
       if (n > 0 && map && (viewMode === 'free' || viewMode === 'fleet')) fitFleet(true);
     }),
@@ -3057,6 +3097,34 @@
     cursor: pointer;
     filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.8));
   }
+  /* Formation slot ghosts (created imperatively → global). */
+  :global(.formation-slot-divicon .formation-slot) {
+    position: relative;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    border: 2px dashed var(--vc, #37a8db);
+    background: rgba(0, 0, 0, 0.35);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--vc, #37a8db);
+    font: 700 11px 'Segoe UI', Tahoma, sans-serif;
+    text-shadow: 0 0 2px #000;
+  }
+  :global(.formation-slot-divicon .formation-slot-name),
+  :global(.formation-slot-divicon .formation-slot-up) {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    white-space: nowrap;
+    font: 600 10px 'Segoe UI', Tahoma, sans-serif;
+    color: #fff;
+    text-shadow: 0 0 2px #000, 0 0 2px #000;
+  }
+  :global(.formation-slot-divicon .formation-slot-name) { top: 100%; margin-top: 1px; }
+  :global(.formation-slot-divicon .formation-slot-up) { bottom: 100%; margin-bottom: 1px; color: #cfe7f3; }
+
   /* Ctrl+drag selection rectangle (created imperatively → global). */
   :global(.fleet-box-select) {
     position: absolute;

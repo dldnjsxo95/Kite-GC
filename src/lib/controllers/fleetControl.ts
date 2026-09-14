@@ -47,6 +47,15 @@ export interface GroupCommandParams {
   offsetM?: number;
   /** missionUpload: direction of that spacing (deg, 0 = north). */
   offsetBearingDeg?: number;
+  /** formationUpload: a distinct plan per vehicle id (slot-offset copies of the reference plan). */
+  plans?: Record<string, ArduWaypoint[]>;
+  /** formationGo: per vehicle, the frontend index of the first route item (home slot added here). */
+  goSeqs?: Record<string, number>;
+}
+
+/** The plan a vehicle would receive for an upload kind (per-vehicle map first, then the shared plan). */
+export function planForVehicle(p: GroupCommandParams, vehicleId: string): ArduWaypoint[] | undefined {
+  return p.plans?.[vehicleId] ?? p.waypoints;
 }
 
 export type GroupItemStatus = 'pending' | 'running' | 'ok' | 'fail' | 'skipped';
@@ -104,6 +113,34 @@ async function sendOne(kind: GroupCommandKind, v: VehicleSummary, p: GroupComman
   const sys = vehicleSystem(v);
   const cls = vehicleClassOf(v);
   switch (kind) {
+    case 'formationGo': {
+      // Release the route: jump every craft from its assembly loiter to the first route item. The FC
+      // item index = frontend index + home slot (ArduPilot reserves item 0 for home, PX4 does not).
+      const idx = p.goSeqs?.[id];
+      if (idx == null) throw new Error('No go target for this vehicle');
+      const seq = idx + (sys === 'px4' ? 0 : 1);
+      await invoke('mav_mission_set_current', { vehicleId: id, seq });
+      // Make sure it is actually flying the mission (an operator may have parked it in Loiter/Hold).
+      const tv = get(allTelemetry).get(id);
+      const mode = tv ? vehicleActiveMode(v, tv) : undefined;
+      const missionKey = sys === 'px4' ? 'mission' : 'auto';
+      if (mode?.key !== missionKey) {
+        if (sys === 'px4') {
+          const m = resolveIntentMode(v, 'mission');
+          if (m) await setModeFor(v, m.main, m.sub);
+        } else {
+          await invoke('mav_mission_start', { vehicleId: id });
+        }
+      }
+      return;
+    }
+    case 'formationUpload': {
+      const plan = p.plans?.[id];
+      if (!plan || plan.length === 0) throw new Error('No formation plan for this vehicle');
+      await invoke('ardu_mission_upload', { vehicleId: id, waypoints: plan });
+      arduSetVehicleMission(id, plan, true);
+      return;
+    }
     case 'missionUpload': {
       const base = p.waypoints ?? [];
       if (base.length === 0) throw new Error('No waypoints to upload');
@@ -150,7 +187,11 @@ async function sendOne(kind: GroupCommandKind, v: VehicleSummary, p: GroupComman
       await setModeFor(v, m.main, m.sub);
       return;
     }
+    case 'missionRestart':
     case 'missionStart': {
+      // Restart rewinds to the first item first — otherwise START / Mission mode RESUME at the item the
+      // vehicle was on when it left the mission (e.g. after an RTL).
+      if (kind === 'missionRestart') await invoke('mav_mission_set_current', { vehicleId: id, seq: 0 });
       // PX4 has no MISSION_START handler — it runs missions by entering the Mission mode.
       if (sys === 'px4') {
         const m = resolveIntentMode(v, 'mission');
@@ -209,9 +250,11 @@ export async function runGroupCommand(
   };
   groupRun.set(run);
 
-  if (kind === 'takeoff') {
-    // Fully serial + stagger, regardless of link.
-    const stagger = Math.max(0, params.staggerMs ?? 1000);
+  // Takeoff is always serial; RTL / Land go serial when a stagger is requested (vehicles converging on
+  // one home / landing spot should arrive one after another).
+  const staggerWanted = (params.staggerMs ?? 0) > 0;
+  if (kind === 'takeoff' || ((kind === 'rtl' || kind === 'land') && staggerWanted)) {
+    const stagger = Math.max(0, params.staggerMs ?? (kind === 'takeoff' ? 1000 : 0));
     for (let i = 0; i < targets.length; i++) {
       if (i > 0 && stagger > 0) await sleep(stagger);
       await runItem(runId, kind, targets[i].vehicle, params, i);

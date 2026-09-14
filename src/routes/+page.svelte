@@ -49,7 +49,9 @@
   import MissionPanel from "$lib/components/mission/MissionPanel.svelte";
   import MavCommandPanel from "$lib/components/control/MavCommandPanel.svelte";
   import FleetPanel from "$lib/components/FleetPanel.svelte";
+  import FormationPanel from "$lib/components/FormationPanel.svelte";
   import GroupCommandBar from "$lib/components/GroupCommandBar.svelte";
+  import "$lib/stores/fleetSeparation"; // fleet separation monitor (self-starting; toasts + fleet panel alerts)
   import { vehicles } from "$lib/stores/vehicles";
   import { isMavlinkVehicle } from "$lib/helpers/fleetStatus";
   import { selectedVehicleIds } from "$lib/stores/fleetSelection";
@@ -810,6 +812,8 @@
   const ICON_MISSION = '<svg viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2.5C8.4 2.5 5.5 5.4 5.5 9c0 4.8 6.5 12.5 6.5 12.5S18.5 13.8 18.5 9c0-3.6-2.9-6.5-6.5-6.5Zm0 4.1A2.4 2.4 0 1 0 12 11.4 2.4 2.4 0 0 0 12 6.6Z"/></svg>';
   // Two solid peaks, slightly raised (Terrain).
   const ICON_TERRAIN = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M1.5 20 8.5 5 13 14 16.5 8.5 22.5 20Z"/></svg>';
+  // Formation flight: three craft in a V with a dashed baseline.
+  const ICON_FORMATION = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polygon points="12,3 9.4,9.5 12,8.2 14.6,9.5" fill="currentColor" stroke="none"/><polygon points="6,10 3.4,16.5 6,15.2 8.6,16.5" fill="currentColor" stroke="none"/><polygon points="18,10 15.4,16.5 18,15.2 20.6,16.5" fill="currentColor" stroke="none"/><path d="M4 20h16" stroke-dasharray="2 3"/></svg>';
   // Fleet (multi-vehicle list + group commands): three craft arrows inside a corner frame.
   const ICON_FLEET = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8V4h4M17 4h4v4M21 16v4h-4M7 20H3v-4"/><polygon points="12,7 9.6,13 12,11.8 14.4,13" fill="currentColor" stroke="none"/><polygon points="7.5,12 5.1,18 7.5,16.8 9.9,18" fill="currentColor" stroke="none"/><polygon points="16.5,12 14.1,18 16.5,16.8 18.9,18" fill="currentColor" stroke="none"/></svg>';
   // Solid flat movie camera (Video): two reels + body + lens funnel.
@@ -858,6 +862,7 @@
     { id: "mission", label: () => $t('nav.mission'), icon: ICON_MISSION },
     { id: "control", label: () => $t('nav.control'), icon: ICON_CONTROL },
     { id: "fleet", label: () => $t('nav.fleet'), icon: ICON_FLEET },
+    { id: "formation", label: () => $t('nav.formation'), icon: ICON_FORMATION },
     { id: "rc-control", label: () => $t('nav.rc'), icon: ICON_RC },
     { id: "terrain", label: () => $t('nav.terrain'), icon: ICON_TERRAIN },
     { id: "logbook", label: () => $t('nav.logbook'), icon: ICON_LOGBOOK },
@@ -879,6 +884,7 @@
       (t.id !== 'logbook' || flightLoggingEnabled) &&
       (t.id !== 'control' || isMavlinkConnected) && // control tab only when connected via MAVLink
       (t.id !== 'fleet' || fleetTabAvailable) &&
+      (t.id !== 'formation' || fleetTabAvailable) && // formation planning needs at least one MAVLink vehicle known
       (t.id !== 'rc-control' || (rcTabAvailable && !isMobile) || mobileRcAvailable) && // RC tab: desktop needs the master switch + a joystick; mobile uses on-screen sticks when a FC is connected
       (t.id !== 'radar' || radarSettings.enabled) && // radar tab only when the master switch is on
       (t.id !== 'airspace' || airspaceSettings.enabled || geozonesAvailable || fenceAvailable || rallyAvailable) // airspace: master switch, or geozone (INAV) / fence+rally (MAVLink) capable FC
@@ -3934,6 +3940,8 @@
           <MavCommandPanel />
         {:else if activeTab === 'fleet'}
           <FleetPanel />
+        {:else if activeTab === 'formation'}
+          <FormationPanel />
         {:else if activeTab === 'rc-control'}
           {#if isMobile}
             <VirtualSticks />

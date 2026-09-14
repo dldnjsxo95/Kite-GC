@@ -16,8 +16,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use ::mavlink::ardupilotmega::{
-    MavMessage, MavCmd, MavFrame, MavResult, MavParamType,
-    COMMAND_LONG_DATA, COMMAND_INT_DATA, PARAM_SET_DATA,
+    MavMessage, MavCmd, MavFrame, MavResult, MavParamType, PositionTargetTypemask,
+    COMMAND_LONG_DATA, COMMAND_INT_DATA, PARAM_SET_DATA, SET_POSITION_TARGET_GLOBAL_INT_DATA,
 };
 
 use super::handler::MavlinkCommand;
@@ -131,6 +131,54 @@ pub fn set_param(
         param_id: param_id.into(),
         param_value,
         param_type,
+    }))
+}
+
+/// Stream one guided position setpoint (`SET_POSITION_TARGET_GLOBAL_INT`). Fire-and-forget — the
+/// message has no COMMAND_ACK, which is exactly what makes it usable at 5–10 Hz per vehicle for the
+/// GCS-driven formation trajectory follower (ArduPilot GUIDED / PX4 OFFBOARD). Acceleration and
+/// yaw-rate are always ignored; velocity feed-forward (NED, m/s) and yaw (rad) are optional.
+pub fn send_position_target(
+    cmd_tx: &mpsc::Sender<MavlinkCommand>,
+    fc_sysid: u8,
+    frame: MavFrame,
+    lat_int: i32,
+    lon_int: i32,
+    alt: f32,
+    vel_ned: Option<[f32; 3]>,
+    yaw_rad: Option<f32>,
+) -> Result<(), String> {
+    type M = PositionTargetTypemask;
+    let mut mask = M::POSITION_TARGET_TYPEMASK_AX_IGNORE
+        | M::POSITION_TARGET_TYPEMASK_AY_IGNORE
+        | M::POSITION_TARGET_TYPEMASK_AZ_IGNORE
+        | M::POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE;
+    if vel_ned.is_none() {
+        mask |= M::POSITION_TARGET_TYPEMASK_VX_IGNORE
+            | M::POSITION_TARGET_TYPEMASK_VY_IGNORE
+            | M::POSITION_TARGET_TYPEMASK_VZ_IGNORE;
+    }
+    if yaw_rad.is_none() {
+        mask |= M::POSITION_TARGET_TYPEMASK_YAW_IGNORE;
+    }
+    let v = vel_ned.unwrap_or([0.0, 0.0, 0.0]);
+    send(cmd_tx, MavMessage::SET_POSITION_TARGET_GLOBAL_INT(SET_POSITION_TARGET_GLOBAL_INT_DATA {
+        time_boot_ms: 0,
+        target_system: fc_sysid,
+        target_component: AUTOPILOT_COMPONENT,
+        coordinate_frame: frame,
+        type_mask: mask,
+        lat_int,
+        lon_int,
+        alt,
+        vx: v[0],
+        vy: v[1],
+        vz: v[2],
+        afx: 0.0,
+        afy: 0.0,
+        afz: 0.0,
+        yaw: yaw_rad.unwrap_or(0.0),
+        yaw_rate: 0.0,
     }))
 }
 
