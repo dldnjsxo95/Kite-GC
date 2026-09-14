@@ -329,9 +329,13 @@ export function missionStart(): Promise<boolean> {
   return runCommand('missionStart', 'mav_mission_start');
 }
 
-/** Rewind the mission to the first item (MP's "Restart Mission" = MISSION_SET_CURRENT(0)). */
-export function missionRestart(): Promise<boolean> {
-  return runCommand('missionRestart', 'mav_mission_set_current', { seq: 0 });
+/** Restart the mission from the first item: MISSION_SET_CURRENT(0) and then start. A bare rewind left
+ *  operators thinking nothing happened (the vehicle sat there until they also pressed Start), and
+ *  Start alone RESUMES at the item the vehicle was on before an RTL. */
+export async function missionRestart(): Promise<boolean> {
+  const ok = await runCommand('missionRestart', 'mav_mission_set_current', { seq: 0 });
+  if (!ok) return false;
+  return missionStart();
 }
 
 /** Download the FC's mission into the working mission so the panel can command it (enables Set active

@@ -35,6 +35,47 @@ fn mav_handle(state: &State<'_, AppState>, vehicle_id: Option<&str>) -> Result<(
     Ok((t.cmd_tx, t.sysid))
 }
 
+/// Stream a guided position setpoint to one vehicle — `SET_POSITION_TARGET_GLOBAL_INT`, fire-and-
+/// forget (no ACK), so the formation trajectory follower can call it at 5–10 Hz per vehicle. `lat`/
+/// `lon` in degrees; `alt` metres, relative to home unless `amsl`. `vx/vy/vz` = NED velocity feed-
+/// forward (all three or none); `yaw_deg` optional. The vehicle must be in ArduPilot GUIDED / PX4
+/// OFFBOARD for the setpoint to take effect.
+#[tauri::command(async)]
+#[allow(clippy::too_many_arguments)] // maps directly onto the message's fields
+pub fn mav_set_position_target(
+    vehicle_id: Option<String>,
+    lat: f64,
+    lon: f64,
+    alt: f32,
+    vx: Option<f32>,
+    vy: Option<f32>,
+    vz: Option<f32>,
+    yaw_deg: Option<f32>,
+    amsl: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let (cmd_tx, fc_sysid) = mav_handle(&state, vehicle_id.as_deref())?;
+    let vel = match (vx, vy, vz) {
+        (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+        _ => None,
+    };
+    // PX4's receiver accepts ONLY the *_INT frames for SET_POSITION_TARGET_GLOBAL_INT ("invalid
+    // coordinate frame 3" otherwise); ArduPilot takes either. The dialect marks them deprecated
+    // synonyms, hence the allow.
+    #[allow(deprecated)]
+    let frame = if amsl.unwrap_or(false) { MavFrame::MAV_FRAME_GLOBAL_INT } else { MavFrame::MAV_FRAME_GLOBAL_RELATIVE_ALT_INT };
+    control::send_position_target(
+        &cmd_tx,
+        fc_sysid,
+        frame,
+        (lat * 1e7).round() as i32,
+        (lon * 1e7).round() as i32,
+        alt,
+        vel,
+        yaw_deg.map(|d| d.to_radians()),
+    )
+}
+
 /// Set the flight mode via `MAV_CMD_DO_SET_MODE`. `main`/`sub` are the firmware-specific custom-mode
 /// parts (ArduPilot: `main` = flat mode number, `sub` = 0; PX4: packed main/sub mode). param1 is the
 /// base mode with `MAV_MODE_FLAG_CUSTOM_MODE_ENABLED` (bit 0) set.

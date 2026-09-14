@@ -119,7 +119,9 @@ export function resolveIntentMode(v: VehicleSummary, intent: FleetModeIntent): M
 // ── Pre-flight checks for a group command ───────────────────────────────────
 
 export type GroupCommandKind =
-  | 'arm' | 'disarm' | 'takeoff' | 'land' | 'rtl' | 'hold' | 'missionStart' | 'changeSpeed' | 'setMode' | 'missionUpload';
+  | 'arm' | 'disarm' | 'takeoff' | 'land' | 'rtl' | 'hold'
+  | 'missionStart' | 'missionRestart' | 'changeSpeed' | 'setMode'
+  | 'missionUpload' | 'formationUpload' | 'formationGo';
 
 /** Whether every command in `wps` is valid for this vehicle's firmware + class (upload sanity). */
 export function planValidForVehicle(v: VehicleSummary, wps: readonly ArduWaypoint[]): boolean {
@@ -153,7 +155,8 @@ export function preflightChecks(
 ): PreflightResult {
   const fails: string[] = [];
   const warns: string[] = [];
-  if (kind === 'missionUpload' && plan && plan.length === 0) fails.push('emptyPlan');
+  const isUpload = kind === 'missionUpload' || kind === 'formationUpload';
+  if (isUpload && plan && plan.length === 0) fails.push('emptyPlan');
 
   if (!isMavlinkVehicle(v)) fails.push('notMavlink');
   if (!vehicleSystem(v)) fails.push('unknownFirmware');
@@ -192,6 +195,8 @@ export function preflightChecks(
       case 'rtl':
       case 'hold':
       case 'missionStart':
+      case 'missionRestart':
+      case 'formationGo':
       case 'changeSpeed':
         if (!armed) warns.push('notArmed');
         break;
@@ -199,6 +204,7 @@ export function preflightChecks(
         if (intent && !resolveIntentMode(v, intent)) fails.push('modeUnsupported');
         break;
       case 'missionUpload':
+      case 'formationUpload':
         // Replacing the mission of a flying aircraft is legal but rarely intended.
         if (armed) warns.push('armedUpload');
         if (plan && plan.length > 0 && !planValidForVehicle(v, plan)) warns.push('cmdInvalid');

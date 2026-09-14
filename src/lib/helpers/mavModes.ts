@@ -91,6 +91,9 @@ const PX4: MavMode[] = [
   { key: 'return',    name: 'Return',     main: 4, sub: 5, stick: false },
   { key: 'takeoff',   name: 'Takeoff',    main: 4, sub: 2, stick: false },
   { key: 'land',      name: 'Land',       main: 4, sub: 6, stick: false },
+  // External setpoints (the GCS formation follower streams SET_POSITION_TARGET). PX4 only accepts the
+  // switch while a setpoint stream is already flowing, and leaves it when the stream stops.
+  { key: 'offboard',  name: 'Offboard',   main: 6, sub: 0, stick: false },
   { key: 'manual',    name: 'Manual',     main: 1, sub: 0, stick: true },
   { key: 'altitude',  name: 'Altitude',   main: 2, sub: 0, stick: true },
   { key: 'position',  name: 'Position',   main: 3, sub: 0, stick: true },
